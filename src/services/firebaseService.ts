@@ -21,6 +21,7 @@ import {
   AttributeKey,
   BunkerSettings,
   FirebaseConfig,
+  GamePack,
   PlayerData,
   RoomData,
 } from '../types/game';
@@ -28,7 +29,11 @@ import {
   drawSingleAttributeCard,
   generatePlayerAttributes,
 } from '../data/defaultPacks';
-import { getFirebaseConfig, getPackById } from './storageService';
+import {
+  getFirebaseConfig,
+  getPackById,
+  saveCustomPack,
+} from './storageService';
 import { generateBunkerFinale } from './geminiService';
 
 export type SyncBackendMode = 'firebase-rtdb' | 'firebase-firestore' | 'local';
@@ -1183,4 +1188,54 @@ async function triggerBotMovesIfNeeded(code: string): Promise<void> {
     await writeRoomRaw(code, room);
   }
 }
+
+export async function sendPlayerHeartbeat(
+  code: string,
+  userUid: string
+): Promise<void> {
+  const room = await readRoomRaw(code);
+  if (!room || !room.players?.[userUid]) return;
+
+  room.players[userUid].lastSeen = Date.now();
+  await writeRoomRaw(code, room);
+}
+
+export async function syncPackToFirebase(pack: GamePack): Promise<void> {
+  try {
+    const payload = sanitizeForFirebase(pack);
+    if (currentMode === 'firebase-rtdb' && rtdbInstance) {
+      await set(ref(rtdbInstance, `packs/${pack.id}`), payload);
+    } else if (currentMode === 'firebase-firestore' && firestoreInstance) {
+      await setDoc(doc(firestoreInstance, 'packs', pack.id), payload);
+    }
+  } catch (err) {
+    console.warn('Could not sync pack to Firebase:', err);
+  }
+}
+
+export async function fetchPackFromFirebaseIfMissing(
+  packId: string
+): Promise<GamePack | null> {
+  try {
+    if (currentMode === 'firebase-rtdb' && rtdbInstance) {
+      const snap = await get(ref(rtdbInstance, `packs/${packId}`));
+      if (snap.exists()) {
+        const pack = snap.val() as GamePack;
+        saveCustomPack(pack);
+        return pack;
+      }
+    } else if (currentMode === 'firebase-firestore' && firestoreInstance) {
+      const snap = await getDoc(doc(firestoreInstance, 'packs', packId));
+      if (snap.exists()) {
+        const pack = snap.data() as GamePack;
+        saveCustomPack(pack);
+        return pack;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
 

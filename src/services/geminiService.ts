@@ -1,17 +1,134 @@
 import { AISummaryData, ATTRIBUTE_METADATA, PlayerData, RoomData } from '../types/game';
-import { getGeminiApiKey, getGeminiModel } from './storageService';
+import { getGeminiApiKey, getGeminiModel, saveGeminiModel } from './storageService';
 
-const CANDIDATE_MODELS = [
+export const DEFAULT_GEMINI_MODELS = [
   'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
   'gemini-2.0-flash',
-  'gemini-1.5-flash',
-  'gemini-1.5-pro',
+  'gemini-2.0-flash-lite',
+  'gemini-flash-latest',
+  'gemini-2.5-pro',
 ];
+
+const AVAILABLE_MODELS_STORAGE_KEY = 'bunker_gemini_available_models_v1';
 
 export interface GeminiTestResult {
   ok: boolean;
   message: string;
   modelUsed?: string;
+  availableModels?: string[];
+}
+
+interface GoogleModelEntry {
+  name: string; // e.g. "models/gemini-2.5-flash"
+  displayName?: string;
+  supportedGenerationMethods?: string[];
+}
+
+export function getCachedAvailableModels(): string[] {
+  try {
+    const raw = localStorage.getItem(AVAILABLE_MODELS_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return DEFAULT_GEMINI_MODELS;
+}
+
+function saveCachedAvailableModels(models: string[]): void {
+  try {
+    localStorage.setItem(AVAILABLE_MODELS_STORAGE_KEY, JSON.stringify(models));
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Calls ModelService.ListModels (GET /v1beta/models) to discover which Gemini models
+ * actually exist and support generateContent for the user's API key.
+ */
+export async function fetchAvailableGeminiModels(apiKey: string): Promise<string[]> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(
+    apiKey.trim()
+  )}`;
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    let parsedMsg = `HTTP ${response.status}`;
+    try {
+      const errJson = JSON.parse(errText);
+      if (errJson?.error?.message) {
+        parsedMsg = errJson.error.message;
+      }
+    } catch {
+      if (errText) parsedMsg = errText.slice(0, 200);
+    }
+    throw new Error(parsedMsg);
+  }
+
+  const data = await response.json();
+  const rawModels: GoogleModelEntry[] = Array.isArray(data?.models) ? data.models : [];
+
+  // Filter for Gemini text/multimodal models that support generateContent
+  // Exclude specialized non-text endpoints (tts, image-generation, embedding, aqa, veo, imagen)
+  const validModels = rawModels
+    .filter((m) => {
+      const methods = m.supportedGenerationMethods || [];
+      if (!methods.includes('generateContent')) return false;
+      const id = (m.name || '').replace(/^models\//, '').toLowerCase();
+      if (!id.includes('gemini')) return false;
+      if (
+        id.includes('tts') ||
+        id.includes('image') ||
+        id.includes('embedding') ||
+        id.includes('vision') ||
+        id.includes('thinking') ||
+        id.includes('computer-use') ||
+        id.includes('robotics') ||
+        id.includes('audio')
+      ) {
+        return false;
+      }
+      return true;
+    })
+    .map((m) => m.name.replace(/^models\//, ''));
+
+  // Sort models to prioritize fast flash models
+  const priorityOrder = [
+    'gemini-2.5-flash',
+    'gemini-2.5-flash-lite',
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-lite',
+    'gemini-flash-latest',
+    'gemini-2.5-pro',
+    'gemini-pro-latest',
+  ];
+
+  validModels.sort((a, b) => {
+    const idxA = priorityOrder.indexOf(a);
+    const idxB = priorityOrder.indexOf(b);
+    if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+    if (idxA !== -1) return -1;
+    if (idxB !== -1) return 1;
+    return a.localeCompare(b);
+  });
+
+  if (validModels.length > 0) {
+    saveCachedAvailableModels(validModels);
+    return validModels;
+  }
+
+  return DEFAULT_GEMINI_MODELS;
 }
 
 async function callGeminiEndpoint(
@@ -20,9 +137,10 @@ async function callGeminiEndpoint(
   prompt: string,
   jsonMode = false
 ): Promise<string> {
+  const cleanModel = model.replace(/^models\//, '').trim();
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model
-  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    cleanModel
+  )}:generateContent?key=${encodeURIComponent(apiKey.trim())}`;
 
   const body: Record<string, unknown> = {
     contents: [
@@ -75,41 +193,106 @@ export async function testGeminiApiKey(
     return { ok: false, message: 'Введите API-ключ Gemini' };
   }
 
-  const modelsToTry = preferredModel
-    ? [preferredModel, ...CANDIDATE_MODELS.filter((m) => m !== preferredModel)]
-    : CANDIDATE_MODELS;
+  // Step 1: Call ModelService.ListModels to validate the key and get the exact supported models
+  let discoveredModels: string[] = [];
+  try {
+    discoveredModels = await fetchAvailableGeminiModels(apiKey);
+  } catch (listErr) {
+    const msg = listErr instanceof Error ? listErr.message : String(listErr);
+    if (msg.toLowerCase().includes('location is not supported')) {
+      return {
+        ok: false,
+        message:
+          'Ошибка региона: Google Gemini API отклоняет запросы с вашего текущего IP-адреса (User location is not supported). Включите VPN для работы с Gemini API.',
+      };
+    }
+    return {
+      ok: false,
+      message: `Ошибка проверки ключа (ListModels): ${msg}`,
+    };
+  }
 
-  let lastError = 'Неизвестная ошибка';
-  for (const model of modelsToTry) {
+  // Build ordered list of models to test generateContent with
+  const cleanPreferred = preferredModel?.replace(/^models\//, '').trim();
+  const modelsToTry: string[] = [];
+
+  if (cleanPreferred && discoveredModels.includes(cleanPreferred)) {
+    modelsToTry.push(cleanPreferred);
+  }
+  for (const m of discoveredModels) {
+    if (!modelsToTry.includes(m)) {
+      modelsToTry.push(m);
+    }
+  }
+  if (modelsToTry.length === 0) {
+    modelsToTry.push(...DEFAULT_GEMINI_MODELS);
+  }
+
+  let firstMeaningfulError: string | null = null;
+
+  // Try up to 4 candidate models from the discovered list
+  for (const model of modelsToTry.slice(0, 4)) {
     try {
       const reply = await callGeminiEndpoint(
         apiKey,
         model,
-        'Ответь одним словом: "ГОТОВО", если связь с бортовым ИИ бункера установлена.',
+        'Ответь одним словом: "ГОТОВО".',
         false
       );
       if (reply) {
+        saveGeminiModel(model);
         return {
           ok: true,
           modelUsed: model,
-          message: `Связь установлена! Активная модель: ${model} (Ответ: ${reply.trim().slice(0, 40)})`,
+          availableModels: discoveredModels,
+          message: `Ключ успешно проверен! Выбрана рабочая модель: ${model} (Доступно моделей: ${discoveredModels.length})`,
         };
       }
     } catch (err) {
-      lastError = err instanceof Error ? err.message : String(err);
-      // If key itself is invalid (400/403 API_KEY_INVALID), stop trying other models
-      if (
-        lastError.toLowerCase().includes('api key not valid') ||
-        lastError.toLowerCase().includes('api_key_invalid')
-      ) {
-        break;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const lower = errMsg.toLowerCase();
+
+      // If regional block, stop immediately and explain clearly
+      if (lower.includes('location is not supported')) {
+        return {
+          ok: false,
+          availableModels: discoveredModels,
+          message:
+            'Ключ распознан, но Google Gemini API блокирует генерацию из вашего региона (User location is not supported). Включите VPN в браузере.',
+        };
+      }
+
+      // If invalid key, stop immediately
+      if (lower.includes('api key not valid') || lower.includes('api_key_invalid')) {
+        return {
+          ok: false,
+          message: `Недействительный API-ключ: ${errMsg}`,
+        };
+      }
+
+      // Do not overwrite a meaningful error (like 429 quota) with a 404 not found
+      if (!firstMeaningfulError || !lower.includes('not found')) {
+        firstMeaningfulError = `[${model}]: ${errMsg}`;
       }
     }
   }
 
+  // If ListModels succeeded, the key IS valid, even if generateContent hit a temporary 429 quota limit
+  if (discoveredModels.length > 0 && firstMeaningfulError?.toLowerCase().includes('quota')) {
+    const fallbackModel = modelsToTry[0];
+    saveGeminiModel(fallbackModel);
+    return {
+      ok: true,
+      modelUsed: fallbackModel,
+      availableModels: discoveredModels,
+      message: `Ключ валиден (найдено ${discoveredModels.length} моделей, выбрана ${fallbackModel}), но сейчас исчерпан минутный лимит бесплатной квоты (429 Quota Exceeded). Подождите 1 минуту перед финалом.`,
+    };
+  }
+
   return {
     ok: false,
-    message: `Ошибка проверки ключа: ${lastError}`,
+    availableModels: discoveredModels,
+    message: `Ошибка генерации: ${firstMeaningfulError || 'Не удалось вызвать модель'}`,
   };
 }
 
@@ -179,7 +362,7 @@ ${exiledBlock}
     }
   ],
   "outsideFate": "<что произошло с изгнанными игроками за гермодверью — пытались ли они штурмовать шлюз или выживали снаружи>",
-  "civilizationOutcome": "<что произошло спустя ${room.settings.duration}, когда настало время открывать люк: кто дожил, смогли ли возродить попузацию и цивилизацию>",
+  "civilizationOutcome": "<что произошло спустя ${room.settings.duration}, когда настало время открывать люк: кто дожил, смогли ли возродить популяцию и цивилизацию>",
   "chapters": [
     {
       "number": "ГЛАВА I",
@@ -274,7 +457,6 @@ export function generateProceduralFinale(room: RoomData): AISummaryData {
     });
   }
 
-  // Check illnesses and phobias among survivors
   for (const s of survivors) {
     const h = s.attributes.health?.text || '';
     const hLower = h.toLowerCase();
@@ -409,13 +591,20 @@ export async function generateBunkerFinale(room: RoomData): Promise<AISummaryDat
     return generateProceduralFinale(room);
   }
 
+  let availableModels = getCachedAvailableModels();
+  try {
+    availableModels = await fetchAvailableGeminiModels(apiKey);
+  } catch {
+    // use cached or default models
+  }
+
   const prompt = buildFinaleSystemPrompt(room);
   const modelsToTry = [
     preferredModel,
-    ...CANDIDATE_MODELS.filter((m) => m !== preferredModel),
+    ...availableModels.filter((m) => m !== preferredModel),
   ];
 
-  for (const model of modelsToTry) {
+  for (const model of modelsToTry.slice(0, 4)) {
     try {
       const rawResponse = await callGeminiEndpoint(apiKey, model, prompt, true);
       const cleaned = rawResponse
@@ -453,4 +642,3 @@ export async function generateBunkerFinale(room: RoomData): Promise<AISummaryDat
 
   return generateProceduralFinale(room);
 }
-

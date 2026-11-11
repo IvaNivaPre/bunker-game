@@ -50,7 +50,10 @@ import {
   initFirebaseFromStorage,
   testFirebaseConnection,
 } from '../services/firebaseService';
-import { testGeminiApiKey } from '../services/geminiService';
+import {
+  getCachedAvailableModels,
+  testGeminiApiKey,
+} from '../services/geminiService';
 
 interface AdminModalProps {
   isOpen: boolean;
@@ -98,6 +101,9 @@ export const AdminModal: React.FC<AdminModalProps> = ({
   // Gemini state
   const [geminiKey, setGeminiKey] = useState<string>(getGeminiApiKey());
   const [geminiModel, setGeminiModel] = useState<string>(getGeminiModel());
+  const [availableModels, setAvailableModels] = useState<string[]>(() =>
+    getCachedAvailableModels()
+  );
   const [geminiStatus, setGeminiStatus] = useState<{
     type: 'idle' | 'loading' | 'success' | 'error';
     message: string;
@@ -190,9 +196,12 @@ export const AdminModal: React.FC<AdminModalProps> = ({
     onSettingsChanged();
     setGeminiStatus({
       type: 'loading',
-      message: 'Отправка тестового запроса к Google Gemini REST API...',
+      message: 'Запрос списка доступных моделей (ListModels) и проверка генерации...',
     });
     const res = await testGeminiApiKey(geminiKey, geminiModel);
+    if (res.availableModels && res.availableModels.length > 0) {
+      setAvailableModels(res.availableModels);
+    }
     if (res.ok && res.modelUsed) {
       setGeminiModel(res.modelUsed);
       saveGeminiModel(res.modelUsed);
@@ -616,17 +625,21 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                     </div>
                     <div>
                       <label className="block text-xs font-mono uppercase text-zinc-300 mb-1.5">
-                        Модель Gemini:
+                        Модель Gemini ({availableModels.length} дост.):
                       </label>
                       <select
                         value={geminiModel}
-                        onChange={(e) => setGeminiModel(e.target.value)}
+                        onChange={(e) => {
+                          setGeminiModel(e.target.value);
+                          saveGeminiModel(e.target.value);
+                        }}
                         className="w-full bg-bunker-950 border border-bunker-600 rounded-xl px-3 py-2.5 text-sm font-mono text-zinc-100 focus:outline-none focus:border-amber-500"
                       >
-                        <option value="gemini-2.5-flash">gemini-2.5-flash (Рекомендуется)</option>
-                        <option value="gemini-2.0-flash">gemini-2.0-flash</option>
-                        <option value="gemini-1.5-flash">gemini-1.5-flash</option>
-                        <option value="gemini-1.5-pro">gemini-1.5-pro</option>
+                        {availableModels.map((m) => (
+                          <option key={m} value={m}>
+                            {m}
+                          </option>
+                        ))}
                       </select>
                     </div>
                   </div>

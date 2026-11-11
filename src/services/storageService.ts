@@ -138,7 +138,11 @@ export function saveGeminiApiKey(key: string): void {
 }
 
 export function getGeminiModel(): string {
-  return localStorage.getItem(KEYS.GEMINI_MODEL) || 'gemini-2.5-flash';
+  const stored = localStorage.getItem(KEYS.GEMINI_MODEL);
+  if (!stored || stored.startsWith('gemini-1.5')) {
+    return 'gemini-2.5-flash';
+  }
+  return stored;
 }
 
 export function saveGeminiModel(model: string): void {
