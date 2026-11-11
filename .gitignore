@@ -1,0 +1,40 @@
+# Зависимости
+node_modules/
+.pnp
+.pnp.js
+
+# Сборка (Vite)
+dist/
+dist-ssr/
+
+# Кэш сборщиков и компиляторов
+.cache/
+.vite/
+*.tsbuildinfo
+
+# Переменные окружения и ключи (Gemini API, Firebase)
+.env
+.env.local
+.env.*.local
+
+# Логи
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Настройки IDE и редакторов
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Системные файлы
+.DS_Store
+Thumbs.db
