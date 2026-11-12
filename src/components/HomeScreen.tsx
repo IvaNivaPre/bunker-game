@@ -192,11 +192,55 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         </div>
 
         {errorMsg && (
-          <div className="p-3.5 rounded-xl bg-red-500/15 border border-red-500/40 text-xs text-red-200 flex items-center justify-between gap-2">
-            <span>{errorMsg}</span>
-            <button onClick={clearError} className="text-red-300 hover:text-white">
-              <X className="w-4 h-4" />
-            </button>
+          <div className="p-4 rounded-2xl bg-red-500/15 border-2 border-red-500/40 text-xs text-red-200 space-y-2.5 animate-fadeIn">
+            <div className="flex items-start justify-between gap-2">
+              <div className="space-y-1">
+                <div className="font-bold text-red-100 text-xs sm:text-sm">
+                  {errorMsg.includes('не найдена')
+                    ? 'Комната не найдена. Проблемы с соединением? Попробуйте включить или, наоборот, выключить VPN'
+                    : errorMsg}
+                </div>
+                {errorMsg.includes('не найдена') && (
+                  <p className="text-[11px] text-red-300/90 leading-relaxed">
+                    Код комнаты: <strong className="font-mono">#{normalizeRoomCode(roomCodeInput) || '---'}</strong>. Убедитесь, что Хост уже открыл лобби, или переключите тумблер VPN и нажмите «Повторить».
+                  </p>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={clearError}
+                className="text-red-300 hover:text-white p-1 shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {normalizeRoomCode(roomCodeInput).length === 3 && (
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  disabled={loading}
+                  onClick={async () => {
+                    const cleaned = normalizeRoomCode(roomCodeInput);
+                    if (cleaned.length !== 3) return;
+                    setLoading(true);
+                    sound.playClick();
+                    try {
+                      await onJoinRoom(
+                        cleaned,
+                        (playerName || getSavedUserName() || 'Выживший').trim()
+                      );
+                    } finally {
+                      setLoading(false);
+                    }
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-bunker-950 font-bold text-xs font-mono flex items-center gap-1.5 transition shadow"
+                >
+                  <RotateCcw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+                  <span>{loading ? 'Подключение...' : 'Повторить попытку (Retry)'}</span>
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -284,6 +328,9 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                   <ArrowRight className="w-4 h-4" />
                 </button>
               </div>
+              <p className="text-[11px] text-zinc-500 font-mono text-center">
+                Не находит комнату? Попробуйте включить или, наоборот, выключить VPN.
+              </p>
             </form>
 
             <div className="flex items-center gap-3 text-xs font-mono text-zinc-600">

@@ -21,6 +21,14 @@ import {
   UserX,
   RotateCcw,
   DoorOpen,
+  Play,
+  Pause,
+  Wrench,
+  HeartPulse,
+  Sparkles,
+  Shuffle,
+  Loader2,
+  Check,
 } from 'lucide-react';
 import {
   ATTRIBUTE_METADATA,
@@ -34,10 +42,16 @@ import {
   advanceTurn,
   castVote,
   finalizeVoting,
+  hostCurePlayerCondition,
+  hostForceToggleReveal,
+  hostReplaceAttributeCard,
+  hostSetPlayerStatus,
+  pauseTimerManual,
   removeOrLeavePlayer,
-  resetOrSetTimer,
+  resetTimerManual,
   revealAttribute,
   startRevoteAfterDefense,
+  startTimerManual,
   startVoting,
   transferHost,
   triggerStandardFinale,
@@ -60,6 +74,16 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
 
   // Track which exile modal IDs have been dismissed by the user via "ОК"
   const [dismissedExileId, setDismissedExileId] = useState<string | null>(null);
+
+  // Voting debounce / lock state (Section 3)
+  const [isSubmittingVote, setIsSubmittingVote] = useState<boolean>(false);
+  const [pendingVoteTargetUid, setPendingVoteTargetUid] = useState<string | null>(null);
+
+  // Host God Mode / In-Game Admin Panel state (Section 4)
+  const [openAdminToolsUid, setOpenAdminToolsUid] = useState<string | null>(null);
+  const [adminAttrKey, setAdminAttrKey] = useState<AttributeKey>('profession');
+  const [adminCustomText, setAdminCustomText] = useState<string>('');
+  const [adminBusy, setAdminBusy] = useState<boolean>(false);
 
   // Ability sheet modal state
   const [abilityModal, setAbilityModal] = useState<{
@@ -90,7 +114,14 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
 
   useEffect(() => {
     if (!room.timerEndAt) {
-      setTimeLeft(null);
+      if (
+        typeof room.timerPausedRemaining === 'number' &&
+        room.timerPausedRemaining >= 0
+      ) {
+        setTimeLeft(room.timerPausedRemaining);
+      } else {
+        setTimeLeft(null);
+      }
       return;
     }
     const updateTimer = () => {
@@ -100,7 +131,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
     updateTimer();
     const interval = setInterval(updateTimer, 500);
     return () => clearInterval(interval);
-  }, [room.timerEndAt]);
+  }, [room.timerEndAt, room.timerPausedRemaining]);
 
   const formatSeconds = (sec: number | null) => {
     if (sec === null) return '--:--';
@@ -121,12 +152,20 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
   };
 
   const handleCastVote = async (targetUid: string) => {
+    if (isSubmittingVote) return;
     setActionError(null);
+    setIsSubmittingVote(true);
+    setPendingVoteTargetUid(targetUid);
     sound.playClick();
     try {
       await castVote(room.code, currentUserUid, targetUid);
+      // Brief lock after server confirmation to prevent double-tap race conditions
+      await new Promise((resolve) => setTimeout(resolve, 350));
     } catch (err) {
       setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsSubmittingVote(false);
+      setPendingVoteTargetUid(null);
     }
   };
 
@@ -175,7 +214,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
             )}
             {room.status === 'TIE_DEFENSE' && (
               <span className="text-amber-400 font-bold animate-pulse">
-                ⚠️ НИЧЬЯ! ОПРАВДАТЕЛЬНАЯ РЕЧЬ КАНДИДАТОВ (30 СЕК)
+                ⚠️ НИЧЬЯ! ОПРАВДАТЕЛЬНАЯ РЕЧЬ КАНДИДАТОВ
               </span>
             )}
             {room.status === 'REVOTE' && (
@@ -476,10 +515,110 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
             <div className="p-4 rounded-2xl bg-bunker-900 border border-bunker-700">
               <div className="text-xs font-mono text-zinc-400 uppercase">Таймер обсуждения</div>
               <div className="text-2xl font-mono font-black text-amber-300 mt-1">
-                {formatSeconds(timeLeft)}
+                {formatSeconds(timeLeft ?? (room.settings.roundTimerSeconds || 90))}
               </div>
               <div className="text-[11px] text-zinc-500 mt-0.5">
-                Пресет: {room.settings.roundTimerSeconds || 'Ручной'} сек
+                {room.timerEndAt
+                  ? '● Отсчёт запущен'
+                  : room.timerPausedRemaining != null
+                  ? '⏸ На паузе'
+                  : '⏹ Ожидание запуска'}
+              </div>
+            </div>
+          </div>
+
+          {/* MANUAL PASSIVE TIMER CONTROLS (Section 1: Exclusively in Bunker Tab) */}
+          <div className="p-4 sm:p-5 rounded-2xl bg-bunker-900 border-2 border-amber-500/40 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-xs font-mono uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
+                  <Clock className="w-4 h-4" />
+                  РУЧНОЕ УПРАВЛЕНИЕ ТАЙМЕРОМ ОБСУЖДЕНИЯ / РАУНДА
+                </div>
+                <p className="text-[11px] text-zinc-400 mt-0.5">
+                  Таймер работает в пассивном режиме (визуальный помощник) и не переключает фазы игры автоматически.
+                </p>
+              </div>
+              <div
+                className={`px-4 py-1.5 rounded-xl font-mono text-xl font-black border ${
+                  room.timerEndAt && timeLeft !== null && timeLeft <= 15
+                    ? 'bg-red-500/20 border-red-500 text-red-300 animate-pulse'
+                    : room.timerEndAt
+                    ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300'
+                    : 'bg-bunker-950 border-bunker-700 text-amber-400'
+                }`}
+              >
+                {formatSeconds(timeLeft ?? (room.settings.roundTimerSeconds || 90))}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+              <div className="flex flex-wrap items-center gap-2">
+                {!room.timerEndAt ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playClick();
+                      startTimerManual(room.code);
+                    }}
+                    className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-bunker-950 font-bold text-xs font-mono uppercase flex items-center gap-1.5 transition shadow"
+                  >
+                    <Play className="w-3.5 h-3.5" />
+                    <span>
+                      {room.timerPausedRemaining != null ? 'Продолжить' : 'Старт'}
+                    </span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      sound.playClick();
+                      pauseTimerManual(room.code);
+                    }}
+                    className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-bunker-950 font-bold text-xs font-mono uppercase flex items-center gap-1.5 transition shadow"
+                  >
+                    <Pause className="w-3.5 h-3.5" />
+                    <span>Пауза</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    sound.playClick();
+                    resetTimerManual(
+                      room.code,
+                      room.settings.roundTimerSeconds || 90
+                    );
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-bunker-800 hover:bg-bunker-700 border border-bunker-600 text-zinc-200 text-xs font-mono flex items-center gap-1.5 transition"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Сброс</span>
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[11px] font-mono text-zinc-500 mr-1">
+                  Длительность:
+                </span>
+                {[30, 60, 90, 120, 180].map((sec) => (
+                  <button
+                    key={sec}
+                    type="button"
+                    onClick={() => {
+                      sound.playClick();
+                      resetTimerManual(room.code, sec);
+                    }}
+                    className={`px-2.5 py-1.5 rounded-lg text-xs font-mono transition ${
+                      (room.settings.roundTimerSeconds || 90) === sec
+                        ? 'bg-amber-500 text-bunker-950 font-bold'
+                        : 'bg-bunker-950 hover:bg-bunker-800 border border-bunker-700 text-zinc-300'
+                    }`}
+                  >
+                    {sec}с
+                  </button>
+                ))}
               </div>
             </div>
           </div>
@@ -499,7 +638,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
           {isHost && (
             <div className="p-4 sm:p-5 rounded-2xl bg-bunker-950 border border-amber-500/40 space-y-3">
               <div className="text-xs font-mono uppercase text-amber-400 flex items-center gap-1.5">
-                <Crown className="w-4 h-4" /> Пульт управления Хоста комнаты
+                <Crown className="w-4 h-4" /> Пульт управления фазами игры (Хост)
               </div>
               <div className="flex flex-wrap gap-2.5">
                 <button
@@ -512,24 +651,17 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                 </button>
                 <button
                   type="button"
-                  onClick={() => resetOrSetTimer(room.code, 60)}
-                  className="px-3 py-2 rounded-xl bg-bunker-800 hover:bg-bunker-700 text-zinc-200 text-xs font-mono"
+                  onClick={() => {
+                    sound.playClick();
+                    setActiveTab('survivors');
+                    if (!openAdminToolsUid && playersList[0]) {
+                      setOpenAdminToolsUid(playersList[0].uid);
+                    }
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-300 text-xs font-mono flex items-center gap-1.5"
                 >
-                  Таймер 60с
-                </button>
-                <button
-                  type="button"
-                  onClick={() => resetOrSetTimer(room.code, 90)}
-                  className="px-3 py-2 rounded-xl bg-bunker-800 hover:bg-bunker-700 text-zinc-200 text-xs font-mono"
-                >
-                  Таймер 90с
-                </button>
-                <button
-                  type="button"
-                  onClick={() => resetOrSetTimer(room.code, 120)}
-                  className="px-3 py-2 rounded-xl bg-bunker-800 hover:bg-bunker-700 text-zinc-200 text-xs font-mono"
-                >
-                  Таймер 120с
+                  <Wrench className="w-3.5 h-3.5" />
+                  Админ-инструменты игроков (Режим Бога)
                 </button>
                 <button
                   type="button"
@@ -605,7 +737,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                       )}
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1.5 flex-wrap">
                       {player.isAlive ? (
                         <span className="text-xs font-mono text-emerald-400 bg-emerald-500/15 px-2.5 py-0.5 rounded-full border border-emerald-500/30">
                           В игре ({revealedCount}/10)
@@ -614,6 +746,32 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                         <span className="text-xs font-mono text-red-400 bg-red-500/15 px-2.5 py-0.5 rounded-full border border-red-500/30">
                           Изгнан (Наблюдатель)
                         </span>
+                      )}
+
+                      {isHost && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            sound.playClick();
+                            if (openAdminToolsUid === player.uid) {
+                              setOpenAdminToolsUid(null);
+                            } else {
+                              setOpenAdminToolsUid(player.uid);
+                              setAdminCustomText(
+                                player.attributes[adminAttrKey]?.text || ''
+                              );
+                            }
+                          }}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-mono flex items-center gap-1 border transition ${
+                            openAdminToolsUid === player.uid
+                              ? 'bg-amber-500 text-bunker-950 border-amber-400 font-bold'
+                              : 'bg-bunker-950 hover:bg-bunker-800 text-amber-300 border-amber-500/40'
+                          }`}
+                          title="Открыть панель администратора игры (Режим Бога) для этого игрока"
+                        >
+                          <Wrench className="w-3 h-3" />
+                          <span>Админ-инструменты</span>
+                        </button>
                       )}
 
                       {isHost && player.uid !== currentUserUid && (
@@ -626,20 +784,234 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                           >
                             <UserCheck className="w-4 h-4" />
                           </button>
-                          {player.isAlive && (
-                            <button
-                              type="button"
-                              onClick={() => removeOrLeavePlayer(room.code, player.uid)}
-                              className="p-1 text-zinc-500 hover:text-red-400"
-                              title="Исключить / Перевести в наблюдатели"
-                            >
-                              <UserX className="w-4 h-4" />
-                            </button>
-                          )}
                         </div>
                       )}
                     </div>
                   </div>
+
+                  {/* HOST GOD MODE / IN-GAME ADMIN TOOLS DRAWER (Section 4) */}
+                  {isHost && openAdminToolsUid === player.uid && (
+                    <div className="p-3.5 rounded-xl bg-bunker-950 border-2 border-amber-500/50 space-y-3 animate-fadeIn">
+                      <div className="flex items-center justify-between gap-2 border-b border-bunker-800 pb-2">
+                        <span className="text-xs font-mono uppercase text-amber-400 font-bold flex items-center gap-1.5">
+                          <Wrench className="w-3.5 h-3.5" />
+                          Режим Бога // Управление игроком: {player.name}
+                        </span>
+                        <span className="text-[10px] font-mono text-zinc-500">
+                          Все действия записываются в журнал
+                        </span>
+                      </div>
+
+                      {/* 1. Health, Phobia & Alive/Spectator Status Controls */}
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={adminBusy}
+                          onClick={async () => {
+                            setAdminBusy(true);
+                            sound.playReveal();
+                            try {
+                              await hostCurePlayerCondition(
+                                room.code,
+                                player.uid,
+                                'health'
+                              );
+                            } finally {
+                              setAdminBusy(false);
+                            }
+                          }}
+                          className="px-2.5 py-1.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-300 text-xs font-mono flex items-center gap-1 transition"
+                        >
+                          <HeartPulse className="w-3.5 h-3.5" />
+                          <span>Вылечить болезнь</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          disabled={adminBusy}
+                          onClick={async () => {
+                            setAdminBusy(true);
+                            sound.playReveal();
+                            try {
+                              await hostCurePlayerCondition(
+                                room.code,
+                                player.uid,
+                                'phobia'
+                              );
+                            } finally {
+                              setAdminBusy(false);
+                            }
+                          }}
+                          className="px-2.5 py-1.5 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/40 text-cyan-300 text-xs font-mono flex items-center gap-1 transition"
+                        >
+                          <Sparkles className="w-3.5 h-3.5" />
+                          <span>Снять фобию</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          disabled={adminBusy}
+                          onClick={async () => {
+                            setAdminBusy(true);
+                            sound.playClick();
+                            try {
+                              await hostSetPlayerStatus(
+                                room.code,
+                                player.uid,
+                                !player.isAlive
+                              );
+                            } finally {
+                              setAdminBusy(false);
+                            }
+                          }}
+                          className={`px-2.5 py-1.5 rounded-lg text-xs font-mono flex items-center gap-1 border transition ${
+                            player.isAlive
+                              ? 'bg-red-500/15 hover:bg-red-500/25 border-red-500/40 text-red-300'
+                              : 'bg-amber-500 hover:bg-amber-400 border-amber-400 text-bunker-950 font-bold'
+                          }`}
+                        >
+                          {player.isAlive ? (
+                            <>
+                              <UserX className="w-3.5 h-3.5" />
+                              <span>Изгнать (В наблюдатели)</span>
+                            </>
+                          ) : (
+                            <>
+                              <UserCheck className="w-3.5 h-3.5" />
+                              <span>Вернуть в игру (Жив)</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+
+                      {/* 2. Force Reveal & Replace Any of 11 Attributes */}
+                      <div className="space-y-2 pt-1 border-t border-bunker-800">
+                        <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-center">
+                          <div className="sm:col-span-5">
+                            <select
+                              value={adminAttrKey}
+                              onChange={(e) => {
+                                const nextKey = e.target.value as AttributeKey;
+                                setAdminAttrKey(nextKey);
+                                setAdminCustomText(
+                                  player.attributes[nextKey]?.text || ''
+                                );
+                              }}
+                              className="w-full h-9 bg-bunker-900 border border-bunker-700 rounded-lg px-2.5 text-xs font-mono text-amber-300 focus:outline-none focus:border-amber-500"
+                            >
+                              {ATTRIBUTE_METADATA.map((m) => (
+                                <option key={m.key} value={m.key}>
+                                  {m.label}{' '}
+                                  {player.attributes[m.key]?.revealed
+                                    ? '(Открыто)'
+                                    : '(Скрыто)'}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+
+                          <div className="sm:col-span-7 flex flex-wrap gap-1.5">
+                            <button
+                              type="button"
+                              disabled={adminBusy}
+                              onClick={async () => {
+                                setAdminBusy(true);
+                                sound.playReveal();
+                                try {
+                                  await hostForceToggleReveal(
+                                    room.code,
+                                    player.uid,
+                                    adminAttrKey
+                                  );
+                                } finally {
+                                  setAdminBusy(false);
+                                }
+                              }}
+                              className="px-2.5 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 text-xs font-mono flex items-center gap-1 transition"
+                            >
+                              {player.attributes[adminAttrKey]?.revealed ? (
+                                <>
+                                  <EyeOff className="w-3.5 h-3.5" />
+                                  <span>Скрыть карту</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Eye className="w-3.5 h-3.5" />
+                                  <span>Вскрыть для всех</span>
+                                </>
+                              )}
+                            </button>
+
+                            <button
+                              type="button"
+                              disabled={adminBusy}
+                              onClick={async () => {
+                                setAdminBusy(true);
+                                sound.playReveal();
+                                try {
+                                  await hostReplaceAttributeCard(
+                                    room.code,
+                                    player.uid,
+                                    adminAttrKey,
+                                    'random'
+                                  );
+                                } finally {
+                                  setAdminBusy(false);
+                                }
+                              }}
+                              className="px-2.5 py-1.5 rounded-lg bg-bunker-800 hover:bg-bunker-700 border border-bunker-600 text-zinc-200 text-xs font-mono flex items-center gap-1 transition"
+                              title="Случайно заменить характеристику из подключённых паков"
+                            >
+                              <Shuffle className="w-3.5 h-3.5 text-amber-400" />
+                              <span>Случайная из пака</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="text-[11px] font-mono text-zinc-400">
+                          Текущее значение:{' '}
+                          <span className="text-zinc-200">
+                            {player.attributes[adminAttrKey]?.text || '—'}
+                          </span>
+                        </div>
+
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            value={adminCustomText}
+                            onChange={(e) => setAdminCustomText(e.target.value)}
+                            placeholder="Введите новый текст характеристики вручную..."
+                            className="flex-1 h-9 bg-bunker-900 border border-bunker-700 rounded-lg px-3 text-xs text-zinc-100 focus:outline-none focus:border-amber-500"
+                          />
+                          <button
+                            type="button"
+                            disabled={adminBusy || !adminCustomText.trim()}
+                            onClick={async () => {
+                              if (!adminCustomText.trim()) return;
+                              setAdminBusy(true);
+                              sound.playClick();
+                              try {
+                                await hostReplaceAttributeCard(
+                                  room.code,
+                                  player.uid,
+                                  adminAttrKey,
+                                  'custom',
+                                  adminCustomText.trim()
+                                );
+                                setAdminCustomText('');
+                              } finally {
+                                setAdminBusy(false);
+                              }
+                            }}
+                            className="px-3 h-9 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-bunker-950 font-bold text-xs font-mono flex items-center gap-1 shrink-0 transition"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                            <span>Заменить</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
 
                   <div className="grid grid-cols-1 gap-1.5 text-xs">
                     {ATTRIBUTE_METADATA.filter((m) => m.key !== 'specialCard').map((meta) => {
@@ -732,15 +1104,11 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
             <div className="p-6 rounded-2xl bg-amber-500/10 border-2 border-amber-500 space-y-5 text-center">
               <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-amber-500 text-bunker-950 font-mono font-black text-xs uppercase">
                 <AlertTriangle className="w-4 h-4" />
-                РАВЕНСТВО ГОЛОСОВ — ОПРАВДАТЕЛЬНАЯ РЕЧЬ (30 СЕКУНД)
-              </div>
-
-              <div className="text-4xl font-mono font-black text-amber-400">
-                {formatSeconds(timeLeft)}
+                РАВЕНСТВО ГОЛОСОВ — ОПРАВДАТЕЛЬНАЯ РЕЧЬ КАНДИДАТОВ
               </div>
 
               <p className="text-sm text-zinc-200 max-w-xl mx-auto">
-                Следующие кандидаты набрали одинаковое максимальное число голосов. У каждого есть 30 секунд на финальную оправдательную речь перед повторным голосованием:
+                Следующие кандидаты набрали одинаковое максимальное число голосов. Дайте каждому кандидату слово для оправдательной речи перед повторным голосованием (при необходимости запустите таймер во вкладке «Бункер»):
               </p>
 
               <div className="flex flex-wrap justify-center gap-3">
@@ -778,7 +1146,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                       : `Тайное голосование за изгнание — Раунд ${room.round}`}
                   </h3>
                   <p className="text-xs text-zinc-400">
-                    Выберите одного кандидата, который должен покинуть бункер. Проголосовало:{' '}
+                    Выберите одного кандидата, который должен покинуть бункер. Подтверждено сервером:{' '}
                     <strong className="text-zinc-100">
                       {totalVotesCast} из {eligibleVoters.length}
                     </strong>
@@ -789,16 +1157,18 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                   <div className="flex flex-wrap gap-2">
                     <button
                       type="button"
+                      disabled={isSubmittingVote}
                       onClick={() => finalizeVoting(room.code, 'random')}
-                      className="px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-bunker-950 font-black text-xs font-mono uppercase transition"
+                      className="px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-bunker-950 font-black text-xs font-mono uppercase transition"
                     >
                       Завершить голосование и подвести итог
                     </button>
                     {room.status === 'REVOTE' && (
                       <button
                         type="button"
+                        disabled={isSubmittingVote}
                         onClick={() => finalizeVoting(room.code, 'skip')}
-                        className="px-3 py-2.5 rounded-xl bg-bunker-800 hover:bg-bunker-700 text-zinc-300 text-xs font-mono flex items-center gap-1"
+                        className="px-3 py-2.5 rounded-xl bg-bunker-800 hover:bg-bunker-700 disabled:opacity-50 text-zinc-300 text-xs font-mono flex items-center gap-1"
                         title="При повторной ничьей никого не изгонять"
                       >
                         <RotateCcw className="w-3.5 h-3.5" /> При ничьей оставить всех
@@ -807,6 +1177,13 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                   </div>
                 )}
               </div>
+
+              {isSubmittingVote && (
+                <div className="p-3 rounded-xl bg-amber-500/15 border border-amber-500/40 text-xs font-mono text-amber-300 flex items-center justify-center gap-2 animate-fadeIn">
+                  <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
+                  <span>Отправка голоса и ожидание подтверждения сервером Firebase...</span>
+                </div>
+              )}
 
               <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
                 {alivePlayers.map((candidate) => {
@@ -818,6 +1195,21 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
 
                   const isMyPick = myVotedTargetUid === candidate.uid;
                   const hasCastVote = Boolean(votesMap[candidate.uid]);
+                  const isPendingThisCandidate =
+                    isSubmittingVote && pendingVoteTargetUid === candidate.uid;
+
+                  // Count confirmed votes against this candidate
+                  const confirmedVotesAgainst = Object.entries(votesMap).reduce(
+                    (acc, [voterId, targetId]) => {
+                      if (targetId !== candidate.uid) return acc;
+                      const voterObj = room.players[voterId];
+                      if (!voterObj?.isAlive || voterObj.voteModifiers?.voteBlocked) {
+                        return acc;
+                      }
+                      return acc + (voterObj.voteModifiers?.doubleVote ? 2 : 1);
+                    },
+                    0
+                  );
 
                   return (
                     <div
@@ -835,15 +1227,22 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                           <span className="text-base font-bold text-zinc-100">
                             {candidate.name}
                           </span>
-                          {hasCastVote ? (
-                            <span className="text-[11px] font-mono text-emerald-400 flex items-center gap-1">
-                              <CheckCircle2 className="w-3.5 h-3.5" /> Проголосовал
-                            </span>
-                          ) : (
-                            <span className="text-[11px] font-mono text-zinc-500">
-                              Думает...
-                            </span>
-                          )}
+                          <div className="flex items-center gap-1.5">
+                            {confirmedVotesAgainst > 0 && (
+                              <span className="px-2 py-0.5 rounded-full bg-red-500/20 border border-red-500/40 font-mono text-[11px] font-bold text-red-300">
+                                Против: {confirmedVotesAgainst}
+                              </span>
+                            )}
+                            {hasCastVote ? (
+                              <span className="text-[11px] font-mono text-emerald-400 flex items-center gap-1">
+                                <CheckCircle2 className="w-3.5 h-3.5" /> Проголосовал
+                              </span>
+                            ) : (
+                              <span className="text-[11px] font-mono text-zinc-500">
+                                Думает...
+                              </span>
+                            )}
+                          </div>
                         </div>
 
                         <div className="text-xs text-zinc-300 space-y-1">
@@ -873,16 +1272,24 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                         isEligibleTarget && (
                           <button
                             type="button"
+                            disabled={isSubmittingVote}
                             onClick={() => handleCastVote(candidate.uid)}
-                            className={`w-full py-2.5 rounded-xl font-mono text-xs font-bold uppercase transition ${
+                            className={`w-full py-2.5 rounded-xl font-mono text-xs font-bold uppercase transition flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed ${
                               isMyPick
                                 ? 'bg-red-500 text-white shadow-lg shadow-red-500/25'
                                 : 'bg-bunker-950 hover:bg-red-500/20 border border-bunker-700 hover:border-red-500/40 text-zinc-200 hover:text-red-200'
                             }`}
                           >
-                            {isMyPick
-                              ? '✓ Ваш голос против этого кандидата'
-                              : 'Голосовать за изгнание'}
+                            {isPendingThisCandidate ? (
+                              <>
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                <span>Отправка голоса...</span>
+                              </>
+                            ) : isMyPick ? (
+                              <span>✓ Ваш голос подтверждён</span>
+                            ) : (
+                              <span>Проголосовать против</span>
+                            )}
                           </button>
                         )}
                     </div>
@@ -914,7 +1321,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                 <div
                   key={idx}
                   className={`p-2 rounded-lg border-l-2 ${
-                    entry.includes('⚡')
+                    entry.includes('⚡') || entry.includes('🛠️')
                       ? 'bg-amber-500/10 border-amber-400 text-amber-200'
                       : entry.includes('🚪') || entry.includes('⚖️')
                       ? 'bg-red-500/10 border-red-400 text-red-200'

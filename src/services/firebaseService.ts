@@ -3,6 +3,7 @@ import {
   getDatabase,
   ref,
   set,
+  update,
   get,
   remove,
   onValue,
@@ -14,6 +15,7 @@ import {
   collection,
   getDocs,
   setDoc,
+  updateDoc,
   getDoc,
   deleteDoc,
   onSnapshot,
@@ -205,11 +207,26 @@ function handleIncomingCloudRoom(code: string, payloadStr: string): void {
     }
 
     const existing = cloudRoomsCache.get(cleanCode) || readLocalRoom(cleanCode);
-    if (
-      existing &&
-      (existing.updatedAt || 0) > (incoming.updatedAt || 0)
-    ) {
-      return;
+    if (existing) {
+      // Preserve concurrent votes during active voting phases to prevent vote jumping
+      if (
+        existing.round === incoming.round &&
+        existing.status === incoming.status &&
+        (incoming.status === 'VOTING' || incoming.status === 'REVOTE') &&
+        existing.votes &&
+        Object.keys(existing.votes).length > 0 &&
+        incoming.votes &&
+        Object.keys(incoming.votes).length > 0
+      ) {
+        incoming.votes = {
+          ...existing.votes,
+          ...incoming.votes,
+        };
+      }
+
+      if ((existing.updatedAt || 0) > (incoming.updatedAt || 0)) {
+        return;
+      }
     }
 
     cloudDeletedCodes.delete(cleanCode);
@@ -1084,7 +1101,7 @@ export async function joinRoom(
       notifyRoomsChanged();
     }
     throw new Error(
-      `Комната с кодом «${cleanCode}» не найдена. Проверьте правильность 3-значного кода комнаты.`
+      `Комната с кодом «${cleanCode}» не найдена. Проблемы с соединением? Попробуйте включить или, наоборот, выключить VPN`
     );
   }
 
@@ -1243,10 +1260,8 @@ export async function startGame(code: string): Promise<void> {
   room.votes = {};
   room.tiedCandidates = [];
   room.lastExileResult = null;
-  room.timerEndAt =
-    room.settings.roundTimerSeconds > 0
-      ? Date.now() + room.settings.roundTimerSeconds * 1000
-      : null;
+  room.timerEndAt = null;
+  room.timerPausedRemaining = null;
 
   room.logs = [
     ...(room.logs || []),
@@ -1500,23 +1515,78 @@ export async function advanceTurn(code: string): Promise<void> {
   const currentIdx = room.currentTurnUid ? aliveOrder.indexOf(room.currentTurnUid) : -1;
   const nextUid = aliveOrder[(currentIdx + 1) % aliveOrder.length];
   room.currentTurnUid = nextUid;
-  if (room.settings.roundTimerSeconds > 0) {
-    room.timerEndAt = Date.now() + room.settings.roundTimerSeconds * 1000;
-  }
 
   await writeRoomRaw(code, room);
   await triggerBotMovesIfNeeded(code);
+}
+
+/**
+ * Manual Timer Controls (Start / Pause / Reset) — exclusively controlled from the Bunker tab.
+ * Never auto-starts on phase changes and never auto-switches game phases.
+ */
+export async function startTimerManual(
+  code: string,
+  durationSeconds?: number
+): Promise<void> {
+  const room = await readRoomRaw(code);
+  if (!room) return;
+
+  const secondsToRun =
+    durationSeconds && durationSeconds > 0
+      ? durationSeconds
+      : room.timerPausedRemaining && room.timerPausedRemaining > 0
+      ? room.timerPausedRemaining
+      : room.settings.roundTimerSeconds && room.settings.roundTimerSeconds > 0
+      ? room.settings.roundTimerSeconds
+      : 90;
+
+  if (durationSeconds && durationSeconds > 0) {
+    room.settings.roundTimerSeconds = durationSeconds;
+  }
+
+  room.timerEndAt = Date.now() + secondsToRun * 1000;
+  room.timerPausedRemaining = null;
+  await writeRoomRaw(code, room);
+}
+
+export async function pauseTimerManual(code: string): Promise<void> {
+  const room = await readRoomRaw(code);
+  if (!room) return;
+
+  if (room.timerEndAt) {
+    const remaining = Math.max(0, Math.ceil((room.timerEndAt - Date.now()) / 1000));
+    room.timerEndAt = null;
+    room.timerPausedRemaining = remaining;
+    await writeRoomRaw(code, room);
+  }
+}
+
+export async function resetTimerManual(
+  code: string,
+  presetSeconds?: number | null
+): Promise<void> {
+  const room = await readRoomRaw(code);
+  if (!room) return;
+
+  if (typeof presetSeconds === 'number' && presetSeconds > 0) {
+    room.settings.roundTimerSeconds = presetSeconds;
+    room.timerPausedRemaining = presetSeconds;
+  } else {
+    room.timerPausedRemaining = null;
+  }
+  room.timerEndAt = null;
+  await writeRoomRaw(code, room);
 }
 
 export async function resetOrSetTimer(
   code: string,
   seconds: number | null
 ): Promise<void> {
-  const room = await readRoomRaw(code);
-  if (!room) return;
-
-  room.timerEndAt = seconds && seconds > 0 ? Date.now() + seconds * 1000 : null;
-  await writeRoomRaw(code, room);
+  if (seconds && seconds > 0) {
+    await startTimerManual(code, seconds);
+  } else {
+    await resetTimerManual(code, null);
+  }
 }
 
 export async function startVoting(code: string): Promise<void> {
@@ -1527,7 +1597,8 @@ export async function startVoting(code: string): Promise<void> {
   room.votes = {};
   room.tiedCandidates = [];
   room.lastVoteTally = {};
-  room.timerEndAt = Date.now() + 60 * 1000;
+  room.timerEndAt = null;
+  room.timerPausedRemaining = null;
   room.logs = [
     ...(room.logs || []),
     `${formatTimeNow()}: ⚖️ Запущено тайное голосование за изгнание (Раунд ${room.round}).`,
@@ -1537,36 +1608,113 @@ export async function startVoting(code: string): Promise<void> {
   await triggerBotMovesIfNeeded(code);
 }
 
+const activeVoteLocks = new Set<string>();
+
 export async function castVote(
   code: string,
   voterUid: string,
   targetUid: string
 ): Promise<void> {
-  const room = await readRoomRaw(code);
-  if (!room) return;
-  if (room.status !== 'VOTING' && room.status !== 'REVOTE') return;
-
-  const voter = room.players[voterUid];
-  const target = room.players[targetUid];
-  if (!voter || !voter.isAlive || !target || !target.isAlive) return;
-
-  if (voter.voteModifiers?.voteBlocked) {
-    throw new Error('Ваше право голоса заблокировано спец. способностью в этом раунде.');
+  const cleanCode = normalizeRoomCode(code);
+  const lockKey = `${cleanCode}_${voterUid}`;
+  if (activeVoteLocks.has(lockKey)) {
+    return;
   }
+  activeVoteLocks.add(lockKey);
 
-  if (
-    room.status === 'REVOTE' &&
-    room.tiedCandidates &&
-    room.tiedCandidates.length > 0 &&
-    !room.tiedCandidates.includes(targetUid)
-  ) {
-    throw new Error('В повторном голосовании можно голосовать только против кандидатов из списка ничьей.');
+  try {
+    const room = await readRoomRaw(cleanCode);
+    if (!room) return;
+    if (room.status !== 'VOTING' && room.status !== 'REVOTE') return;
+
+    const voter = room.players[voterUid];
+    const target = room.players[targetUid];
+    if (!voter || !voter.isAlive || !target || !target.isAlive) return;
+
+    if (voter.voteModifiers?.voteBlocked) {
+      throw new Error('Ваше право голоса заблокировано спец. способностью в этом раунде.');
+    }
+
+    if (
+      room.status === 'REVOTE' &&
+      room.tiedCandidates &&
+      room.tiedCandidates.length > 0 &&
+      !room.tiedCandidates.includes(targetUid)
+    ) {
+      throw new Error(
+        'В повторном голосовании можно голосовать только против кандидатов из списка ничьей.'
+      );
+    }
+
+    const now = Date.now();
+    room.votes = {
+      ...(room.votes || {}),
+      [voterUid]: targetUid,
+    };
+    room.updatedAt = now;
+
+    // 1. Atomic path update on Firebase so concurrent votes from other players are never overwritten
+    const atomicWrites: Promise<unknown>[] = [];
+    if (rtdbInstance && currentMode === 'firebase-rtdb') {
+      atomicWrites.push(
+        withTimeout(
+          update(ref(rtdbInstance, `rooms/${cleanCode}`), {
+            [`votes/${voterUid}`]: targetUid,
+            updatedAt: now,
+          }),
+          3500,
+          undefined
+        )
+      );
+    }
+    if (firestoreInstance && currentMode === 'firebase-firestore') {
+      atomicWrites.push(
+        withTimeout(
+          updateDoc(doc(firestoreInstance, 'rooms', cleanCode), {
+            [`votes.${voterUid}`]: targetUid,
+            updatedAt: now,
+          }),
+          3500,
+          undefined
+        )
+      );
+    }
+
+    if (atomicWrites.length > 0) {
+      await Promise.all(atomicWrites);
+    }
+
+    // 2. Re-read latest local/cloud votes to merge any concurrent votes that arrived during await
+    const latestCached = cloudRoomsCache.get(cleanCode) || readLocalRoom(cleanCode);
+    const mergedRoom: RoomData = sanitizeForFirebase({
+      ...(latestCached || room),
+      status: room.status,
+      round: room.round,
+      votes: {
+        ...(latestCached?.votes || {}),
+        ...(room.votes || {}),
+        [voterUid]: targetUid,
+      },
+      updatedAt: now,
+    });
+
+    cloudRoomsCache.set(cleanCode, mergedRoom);
+    localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(mergedRoom));
+    broadcastChannel?.postMessage({ code: cleanCode, room: mergedRoom });
+    localSubscribers.get(cleanCode)?.forEach((cb) => cb(mergedRoom));
+    notifyRoomsChanged();
+
+    connectCloudRelay();
+    sendMqttRaw(
+      buildMqttPublishPacket(
+        `${CLOUD_TOPIC_PREFIX}/rooms/${cleanCode}`,
+        JSON.stringify(mergedRoom),
+        true
+      )
+    );
+  } finally {
+    activeVoteLocks.delete(lockKey);
   }
-
-  room.votes = room.votes || {};
-  room.votes[voterUid] = targetUid;
-
-  await writeRoomRaw(code, room);
 }
 
 export async function startRevoteAfterDefense(code: string): Promise<void> {
@@ -1575,7 +1723,8 @@ export async function startRevoteAfterDefense(code: string): Promise<void> {
 
   room.status = 'REVOTE';
   room.votes = {};
-  room.timerEndAt = Date.now() + 45 * 1000;
+  room.timerEndAt = null;
+  room.timerPausedRemaining = null;
   const candidateNames = (room.tiedCandidates || [])
     .map((uid) => room.players[uid]?.name)
     .filter(Boolean)
@@ -1641,11 +1790,12 @@ export async function finalizeVoting(
   if (leaders.length > 1 && room.status === 'VOTING') {
     room.status = 'TIE_DEFENSE';
     room.tiedCandidates = leaders;
-    room.timerEndAt = Date.now() + 30 * 1000;
+    room.timerEndAt = null;
+    room.timerPausedRemaining = null;
     const tiedNames = leaders.map((id) => room.players[id]?.name).join(' и ');
     room.logs = [
       ...(room.logs || []),
-      `${formatTimeNow()}: ⚠️ НИЧЬЯ НА ГОЛОСОВАНИИ (${maxVotes} гол.) между: ${tiedNames}! Объявляется фаза оправдательных речей (30 секунд).`,
+      `${formatTimeNow()}: ⚠️ НИЧЬЯ НА ГОЛОСОВАНИИ (${maxVotes} гол.) между: ${tiedNames}! Объявляется фаза оправдательных речей.`,
     ];
     await writeRoomRaw(code, room);
     return;
@@ -1729,10 +1879,8 @@ function resetRoundStateForPlayers(room: RoomData) {
     p.voteModifiers = {};
   }
   room.currentTurnUid = aliveOrder[0] || null;
-  room.timerEndAt =
-    room.settings.roundTimerSeconds > 0
-      ? Date.now() + room.settings.roundTimerSeconds * 1000
-      : null;
+  room.timerEndAt = null;
+  room.timerPausedRemaining = null;
 }
 
 export async function triggerStandardFinale(code: string): Promise<void> {
@@ -1921,4 +2069,155 @@ export async function deleteEntityFromFirebase(
   } catch {
     // ignore
   }
+}
+
+// ============================================================================
+// HOST GOD MODE / IN-GAME ADMIN TOOLS FOR ROOM CREATOR (Section 4)
+// ============================================================================
+
+export async function hostForceToggleReveal(
+  code: string,
+  targetUid: string,
+  attrKey: AttributeKey,
+  forceReveal?: boolean
+): Promise<void> {
+  const room = await readRoomRaw(code);
+  if (!room) return;
+  const player = room.players[targetUid];
+  if (!player || !player.attributes[attrKey]) return;
+
+  const card = player.attributes[attrKey];
+  const nextState = forceReveal !== undefined ? forceReveal : !card.revealed;
+  card.revealed = nextState;
+
+  const meta = ATTRIBUTE_METADATA.find((m) => m.key === attrKey);
+  const label = meta?.label || attrKey;
+
+  room.logs = [
+    ...(room.logs || []),
+    `${formatTimeNow()}: 🛠️ [Админ-инструменты] Хост принудительно ${
+      nextState ? `вскрыл характеристику «${label}» (${card.text})` : `скрыл характеристику «${label}»`
+    } игрока ${player.name}.`,
+  ];
+
+  await writeRoomRaw(code, room);
+}
+
+export async function hostReplaceAttributeCard(
+  code: string,
+  targetUid: string,
+  attrKey: AttributeKey,
+  mode: 'custom' | 'random',
+  customText?: string
+): Promise<void> {
+  const room = await readRoomRaw(code);
+  if (!room) return;
+  const player = room.players[targetUid];
+  if (!player || !player.attributes[attrKey]) return;
+
+  const meta = ATTRIBUTE_METADATA.find((m) => m.key === attrKey);
+  const label = meta?.label || attrKey;
+  const wasRevealed = player.attributes[attrKey].revealed;
+
+  if (mode === 'random') {
+    const selectedPacks = getRoomSelectedPacks(room);
+    const existingTexts = Object.values(room.players).map(
+      (p) => p.attributes[attrKey]?.text || ''
+    );
+    const newCard = drawSingleAttributeCardFromPacks(
+      selectedPacks,
+      attrKey,
+      existingTexts
+    );
+    player.attributes[attrKey] = {
+      ...newCard,
+      revealed: wasRevealed,
+    };
+  } else {
+    const cleanText = (customText || '').trim();
+    if (!cleanText) return;
+    player.attributes[attrKey] = {
+      ...player.attributes[attrKey],
+      text: cleanText,
+    };
+  }
+
+  const updatedText = player.attributes[attrKey].text;
+  room.logs = [
+    ...(room.logs || []),
+    `${formatTimeNow()}: 🛠️ [Админ-инструменты] Хост принудительно обновил характеристику «${label}» игрока ${
+      player.name
+    }${player.attributes[attrKey].revealed ? ` → «${updatedText}»` : ''}.`,
+  ];
+
+  await writeRoomRaw(code, room);
+}
+
+export async function hostCurePlayerCondition(
+  code: string,
+  targetUid: string,
+  conditionType: 'health' | 'phobia'
+): Promise<void> {
+  const room = await readRoomRaw(code);
+  if (!room) return;
+  const player = room.players[targetUid];
+  if (!player) return;
+
+  if (conditionType === 'health') {
+    player.attributes.health = {
+      ...player.attributes.health,
+      text: 'Идеальное здоровье (вылечен решением Хоста)',
+      condition: undefined,
+      rarity: 'epic',
+      revealed: true,
+    };
+    room.logs = [
+      ...(room.logs || []),
+      `${formatTimeNow()}: 🛠️ [Админ-инструменты] Хост вылечил игрока ${player.name} (сброшена карточка болезни).`,
+    ];
+  } else {
+    player.attributes.phobia = {
+      ...player.attributes.phobia,
+      text: 'Фобия отсутствует (снята решением Хоста)',
+      condition: undefined,
+      rarity: 'epic',
+      revealed: true,
+    };
+    room.logs = [
+      ...(room.logs || []),
+      `${formatTimeNow()}: 🛠️ [Админ-инструменты] Хост избавил игрока ${player.name} от фобии.`,
+    ];
+  }
+
+  await writeRoomRaw(code, room);
+}
+
+export async function hostSetPlayerStatus(
+  code: string,
+  targetUid: string,
+  isAlive: boolean
+): Promise<void> {
+  const room = await readRoomRaw(code);
+  if (!room) return;
+  const player = room.players[targetUid];
+  if (!player) return;
+
+  player.isAlive = isAlive;
+  if (!isAlive && room.votes) {
+    delete room.votes[targetUid];
+    for (const [voter, candidate] of Object.entries(room.votes)) {
+      if (candidate === targetUid) {
+        delete room.votes[voter];
+      }
+    }
+  }
+
+  room.logs = [
+    ...(room.logs || []),
+    `${formatTimeNow()}: 🛠️ [Админ-инструменты] Хост принудительно изменил статус игрока ${
+      player.name
+    } на «${isAlive ? 'Жив (В бункере)' : 'Изгнан (Наблюдатель)'}».`,
+  ];
+
+  await writeRoomRaw(code, room);
 }
