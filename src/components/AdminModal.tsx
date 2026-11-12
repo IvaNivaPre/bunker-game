@@ -315,6 +315,7 @@ export const AdminModal: React.FC<AdminModalProps> = ({
     } else if (kind === 'room') {
       await deleteRoomCompletely(id);
       await refreshActiveRooms();
+      onSettingsChanged();
       setNoticeMsg(`Комната #${id} принудительно завершена и удалена из базы данных.`);
     }
   };
@@ -539,33 +540,33 @@ export const AdminModal: React.FC<AdminModalProps> = ({
     <div
       className={
         isFullPageRoute
-          ? 'min-h-screen bg-bunker-950 p-3 sm:p-6'
-          : 'fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto'
+          ? 'min-h-screen bg-bunker-950 p-2 sm:p-6'
+          : 'fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4'
       }
     >
       <div
         className={`w-full max-w-6xl mx-auto bg-bunker-900 border-2 border-bunker-600 rounded-2xl shadow-2xl overflow-hidden flex flex-col ${
-          isFullPageRoute ? 'min-h-[88vh]' : 'max-h-[93vh]'
+          isFullPageRoute ? 'min-h-[88vh]' : 'h-[92vh] max-h-[92vh]'
         }`}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-bunker-700 bg-bunker-950">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-amber-500/15 border border-amber-500/40 flex items-center justify-center text-amber-400">
+        <div className="shrink-0 flex items-center justify-between gap-2 px-4 sm:px-5 py-3.5 sm:py-4 border-b border-bunker-700 bg-bunker-950 relative z-20">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-9 h-9 rounded-lg bg-amber-500/15 border border-amber-500/40 flex items-center justify-center text-amber-400 shrink-0">
               <ShieldCheck className="w-5 h-5" />
             </div>
-            <div>
-              <h2 className="text-base sm:text-lg font-bold text-zinc-100 font-mono tracking-wide">
-                ПАНЕЛЬ АДМИНИСТРИРОВАНИЯ (/admin) // УПРАВЛЕНИЕ ПАКАМИ И КОМНАТАМИ
+            <div className="min-w-0">
+              <h2 className="text-sm sm:text-lg font-bold text-zinc-100 font-mono tracking-wide truncate">
+                ПАНЕЛЬ АДМИНИСТРИРОВАНИЯ (/admin)
               </h2>
-              <p className="text-xs text-zinc-400">
-                Изолированный редактор пресетов бункера, сценариев катастроф, паков характеристик и активных сессий
+              <p className="text-[11px] sm:text-xs text-zinc-400 truncate">
+                Редактор бункеров, катастроф, паков характеристик и активных сессий
               </p>
             </div>
           </div>
           <button
             onClick={onClose}
-            className="px-3 py-2 rounded-xl bg-bunker-800 hover:bg-bunker-700 text-zinc-200 text-xs font-mono flex items-center gap-1.5 transition"
+            className="shrink-0 px-3 py-2 rounded-xl bg-bunker-800 hover:bg-bunker-700 text-zinc-200 text-xs font-mono flex items-center gap-1.5 transition"
           >
             <X className="w-4 h-4" />
             <span>На главную</span>
@@ -627,58 +628,62 @@ export const AdminModal: React.FC<AdminModalProps> = ({
         ) : (
           <>
             {/* Top Navigation Tabs */}
-            <div className="flex border-b border-bunker-700 bg-bunker-950/60 px-4 overflow-x-auto">
+            <div className="shrink-0 grid grid-cols-2 lg:flex border-b border-bunker-700 bg-bunker-950 px-2 sm:px-4 py-1.5 lg:py-0 gap-1.5 lg:gap-1 relative z-20">
               <button
+                type="button"
                 onClick={() => setActiveTab('entities')}
-                className={`flex items-center gap-2 px-4 py-3 text-xs sm:text-sm font-mono border-b-2 transition whitespace-nowrap ${
+                className={`flex items-center justify-center lg:justify-start gap-2 px-3 sm:px-4 py-2.5 lg:py-3 text-xs sm:text-sm font-mono rounded-xl lg:rounded-none lg:border-b-2 transition ${
                   activeTab === 'entities'
-                    ? 'border-amber-500 text-amber-400 font-semibold'
-                    : 'border-transparent text-zinc-400 hover:text-zinc-200'
+                    ? 'bg-amber-500/15 lg:bg-transparent border border-amber-500/50 lg:border-0 lg:border-b-2 lg:border-amber-500 text-amber-400 font-semibold'
+                    : 'bg-bunker-900/70 lg:bg-transparent border border-bunker-800 lg:border-0 lg:border-b-2 lg:border-transparent text-zinc-400 hover:text-zinc-200'
                 }`}
               >
-                <Package className="w-4 h-4" />
-                1. Редактор материалов (Паки / Катастрофы / Бункеры)
+                <Package className="w-4 h-4 shrink-0" />
+                <span className="truncate">1. Редактор материалов</span>
               </button>
 
               <button
+                type="button"
                 onClick={() => setActiveTab('rooms')}
-                className={`flex items-center gap-2 px-4 py-3 text-xs sm:text-sm font-mono border-b-2 transition whitespace-nowrap ${
+                className={`flex items-center justify-center lg:justify-start gap-2 px-3 sm:px-4 py-2.5 lg:py-3 text-xs sm:text-sm font-mono rounded-xl lg:rounded-none lg:border-b-2 transition ${
                   activeTab === 'rooms'
-                    ? 'border-amber-500 text-amber-400 font-semibold'
-                    : 'border-transparent text-zinc-400 hover:text-zinc-200'
+                    ? 'bg-amber-500/15 lg:bg-transparent border border-amber-500/50 lg:border-0 lg:border-b-2 lg:border-amber-500 text-amber-400 font-semibold'
+                    : 'bg-bunker-900/70 lg:bg-transparent border border-bunker-800 lg:border-0 lg:border-b-2 lg:border-transparent text-zinc-400 hover:text-zinc-200'
                 }`}
               >
-                <Radio className="w-4 h-4" />
-                2. Активные комнаты ({activeRooms.length})
+                <Radio className="w-4 h-4 shrink-0" />
+                <span className="truncate">2. Активные комнаты ({activeRooms.length})</span>
               </button>
 
               <button
+                type="button"
                 onClick={() => setActiveTab('firebase')}
-                className={`flex items-center gap-2 px-4 py-3 text-xs sm:text-sm font-mono border-b-2 transition whitespace-nowrap ${
+                className={`flex items-center justify-center lg:justify-start gap-2 px-3 sm:px-4 py-2.5 lg:py-3 text-xs sm:text-sm font-mono rounded-xl lg:rounded-none lg:border-b-2 transition ${
                   activeTab === 'firebase'
-                    ? 'border-amber-500 text-amber-400 font-semibold'
-                    : 'border-transparent text-zinc-400 hover:text-zinc-200'
+                    ? 'bg-amber-500/15 lg:bg-transparent border border-amber-500/50 lg:border-0 lg:border-b-2 lg:border-amber-500 text-amber-400 font-semibold'
+                    : 'bg-bunker-900/70 lg:bg-transparent border border-bunker-800 lg:border-0 lg:border-b-2 lg:border-transparent text-zinc-400 hover:text-zinc-200'
                 }`}
               >
-                <Database className="w-4 h-4" />
-                3. Конфигуратор Firebase
+                <Database className="w-4 h-4 shrink-0" />
+                <span className="truncate">3. Конфигуратор Firebase</span>
               </button>
 
               <button
+                type="button"
                 onClick={() => setActiveTab('security')}
-                className={`flex items-center gap-2 px-4 py-3 text-xs sm:text-sm font-mono border-b-2 transition whitespace-nowrap ${
+                className={`flex items-center justify-center lg:justify-start gap-2 px-3 sm:px-4 py-2.5 lg:py-3 text-xs sm:text-sm font-mono rounded-xl lg:rounded-none lg:border-b-2 transition ${
                   activeTab === 'security'
-                    ? 'border-amber-500 text-amber-400 font-semibold'
-                    : 'border-transparent text-zinc-400 hover:text-zinc-200'
+                    ? 'bg-amber-500/15 lg:bg-transparent border border-amber-500/50 lg:border-0 lg:border-b-2 lg:border-amber-500 text-amber-400 font-semibold'
+                    : 'bg-bunker-900/70 lg:bg-transparent border border-bunker-800 lg:border-0 lg:border-b-2 lg:border-transparent text-zinc-400 hover:text-zinc-200'
                 }`}
               >
-                <KeyRound className="w-4 h-4" />
-                4. Пароль администратора
+                <KeyRound className="w-4 h-4 shrink-0" />
+                <span className="truncate">4. Пароль админа</span>
               </button>
             </div>
 
             {/* Main Content */}
-            <div className="p-4 sm:p-6 overflow-y-auto flex-1 space-y-5">
+            <div className="p-3 sm:p-6 overflow-y-auto flex-1 min-h-0 space-y-5 relative z-10">
               {noticeMsg && (
                 <div className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/40 text-xs font-mono text-emerald-300 flex items-center justify-between">
                   <span>✓ {noticeMsg}</span>
@@ -742,21 +747,23 @@ export const AdminModal: React.FC<AdminModalProps> = ({
 
                   {/* Search, Entity Type Filter, Tag Filter & Sorting Toolbar (Section 2.2) */}
                   <div className="p-4 rounded-2xl bg-bunker-950 border border-bunker-800 space-y-3">
-                    <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
+                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-center">
                       {/* Search input */}
-                      <div className="md:col-span-5 relative">
-                        <Search className="w-4 h-4 text-zinc-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                        <input
-                          type="text"
-                          value={searchQuery}
-                          onChange={(e) => setSearchQuery(e.target.value)}
-                          placeholder="Поиск по названию, описанию или ключевым словам..."
-                          className="w-full bg-bunker-900 border border-bunker-700 rounded-xl pl-10 pr-3 py-2.5 text-xs text-zinc-100 focus:outline-none focus:border-amber-500"
-                        />
+                      <div className="lg:col-span-4 flex items-center">
+                        <div className="relative w-full flex items-center">
+                          <Search className="w-4 h-4 text-zinc-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                          <input
+                            type="text"
+                            value={searchQuery}
+                            onChange={(e) => setSearchQuery(e.target.value)}
+                            placeholder="Поиск по названию, описанию, словам..."
+                            className="w-full h-11 bg-bunker-900 border border-bunker-700 rounded-xl pl-10 pr-3 text-xs text-zinc-100 focus:outline-none focus:border-amber-500"
+                          />
+                        </div>
                       </div>
 
                       {/* Entity Type Filter */}
-                      <div className="md:col-span-4 flex bg-bunker-900 p-1 rounded-xl border border-bunker-700">
+                      <div className="lg:col-span-5 grid grid-cols-2 sm:grid-cols-4 gap-1 bg-bunker-900 p-1 rounded-xl border border-bunker-700 min-h-[2.75rem] items-center">
                         {[
                           { id: 'all', label: 'Все' },
                           { id: 'packs', label: `Паки (${packs.length})` },
@@ -767,10 +774,10 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                             key={f.id}
                             type="button"
                             onClick={() => setEntityFilter(f.id as AdminEntityFilter)}
-                            className={`flex-1 py-1.5 px-2 rounded-lg text-[11px] font-mono transition ${
+                            className={`h-9 px-2 rounded-lg text-[11px] font-mono transition flex items-center justify-center text-center whitespace-nowrap ${
                               entityFilter === f.id
-                                ? 'bg-amber-500 text-bunker-950 font-bold'
-                                : 'text-zinc-400 hover:text-zinc-200'
+                                ? 'bg-amber-500 text-bunker-950 font-bold shadow'
+                                : 'text-zinc-400 hover:text-zinc-200 hover:bg-bunker-800/60'
                             }`}
                           >
                             {f.label}
@@ -779,17 +786,19 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                       </div>
 
                       {/* Sort dropdown */}
-                      <div className="md:col-span-3 relative">
-                        <ArrowUpDown className="w-4 h-4 text-amber-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-                        <select
-                          value={sortBy}
-                          onChange={(e) => setSortBy(e.target.value as PackSortOption)}
-                          className="w-full bg-bunker-900 border border-bunker-700 rounded-xl pl-9 pr-3 py-2.5 text-xs font-mono text-zinc-200 focus:outline-none focus:border-amber-500"
-                        >
-                          <option value="date">Сортировка: По дате</option>
-                          <option value="alphabet">Сортировка: По алфавиту</option>
-                          <option value="cardsCount">Сортировка: По кол-ву карт / размеру</option>
-                        </select>
+                      <div className="lg:col-span-3 flex items-center">
+                        <div className="relative w-full flex items-center">
+                          <ArrowUpDown className="w-4 h-4 text-amber-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                          <select
+                            value={sortBy}
+                            onChange={(e) => setSortBy(e.target.value as PackSortOption)}
+                            className="w-full h-11 bg-bunker-900 border border-bunker-700 rounded-xl pl-10 pr-3 text-xs font-mono text-zinc-200 focus:outline-none focus:border-amber-500"
+                          >
+                            <option value="date">Сортировка: По дате</option>
+                            <option value="alphabet">Сортировка: По алфавиту</option>
+                            <option value="cardsCount">Сортировка: По кол-ву карт / размеру</option>
+                          </select>
+                        </div>
                       </div>
                     </div>
 

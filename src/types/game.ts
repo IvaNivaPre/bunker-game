@@ -117,6 +117,7 @@ export interface RoomData {
   tiedCandidates?: string[];
   lastVoteTally?: Record<string, number>;
   lastExileResult?: ExileResultData | null;
+  firebaseConfig?: FirebaseConfig;
   logs: string[];
 }
 

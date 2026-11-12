@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   ShieldAlert,
   PlusCircle,
@@ -17,10 +17,15 @@ import {
   getAllPacks,
   getLastRoomCode,
   getSavedUserName,
+  saveLastRoomCode,
   saveUserName,
   setActivePackIds,
 } from '../services/storageService';
-import { getSyncMode, normalizeRoomCode } from '../services/firebaseService';
+import {
+  checkRoomExists,
+  getSyncMode,
+  normalizeRoomCode,
+} from '../services/firebaseService';
 import { PackMultiSelector } from './PackMultiSelector';
 import { sound } from '../services/soundService';
 
@@ -47,10 +52,44 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   );
   const [loading, setLoading] = useState<boolean>(false);
   const [showRules, setShowRules] = useState<boolean>(false);
+  const [lastRoom, setLastRoom] = useState<string | null>(() => getLastRoomCode());
 
   const packs = getAllPacks();
-  const lastRoom = getLastRoomCode();
   const syncMode = getSyncMode();
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const verifySavedRoom = async () => {
+      const saved = getLastRoomCode();
+      if (!saved) {
+        if (!cancelled) setLastRoom(null);
+        return;
+      }
+      const exists = await checkRoomExists(saved);
+      if (cancelled) return;
+      if (!exists) {
+        saveLastRoomCode(null);
+        setLastRoom(null);
+      } else {
+        setLastRoom(normalizeRoomCode(saved));
+      }
+    };
+
+    verifySavedRoom();
+
+    const handleRoomsUpdated = () => {
+      verifySavedRoom();
+    };
+
+    window.addEventListener('bunker-rooms-updated', handleRoomsUpdated);
+    window.addEventListener('storage', handleRoomsUpdated);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('bunker-rooms-updated', handleRoomsUpdated);
+      window.removeEventListener('storage', handleRoomsUpdated);
+    };
+  }, []);
 
   const selectedPackNames = packs
     .filter((p) => selectedPackIds.includes(p.id))
@@ -164,30 +203,43 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         {/* Quick Rejoin Banner */}
         {lastRoom && step === 'main' && (
           <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-between gap-3">
-            <div className="text-xs">
+            <div className="text-xs min-w-0">
               <span className="text-emerald-300 font-mono block uppercase">
                 Активная сессия: Бункер #{lastRoom}
               </span>
-              <span className="text-zinc-400">
+              <span className="text-zinc-400 truncate block">
                 Вернуться в комнату под именем {playerName || 'Выживший'}
               </span>
             </div>
-            <button
-              type="button"
-              onClick={() => {
-                const cleaned = normalizeRoomCode(lastRoom);
-                setRoomCodeInput(cleaned);
-                if (playerName.trim()) {
-                  onJoinRoom(cleaned, playerName.trim());
-                } else {
-                  setStep('join-name');
-                }
-              }}
-              className="px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-bunker-950 font-bold text-xs font-mono flex items-center gap-1.5 shrink-0 transition"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              Вернуться
-            </button>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  const cleaned = normalizeRoomCode(lastRoom);
+                  setRoomCodeInput(cleaned);
+                  if (playerName.trim()) {
+                    onJoinRoom(cleaned, playerName.trim());
+                  } else {
+                    setStep('join-name');
+                  }
+                }}
+                className="px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-bunker-950 font-bold text-xs font-mono flex items-center gap-1.5 transition"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Вернуться
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  saveLastRoomCode(null);
+                  setLastRoom(null);
+                }}
+                title="Скрыть уведомление о сессии"
+                className="p-2 rounded-lg bg-bunker-900/80 hover:bg-bunker-800 text-zinc-400 hover:text-zinc-200 transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
           </div>
         )}
 

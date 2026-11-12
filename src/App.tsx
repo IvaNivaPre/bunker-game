@@ -5,6 +5,7 @@ import {
   saveLastRoomCode,
 } from './services/storageService';
 import {
+  checkRoomExists,
   createRoom,
   joinRoom,
   normalizeRoomCode,
@@ -173,7 +174,18 @@ export const App: React.FC = () => {
       <AdminModal
         isOpen={isAdminOpen}
         onClose={closeAdminPage}
-        onSettingsChanged={() => setSettingsTick((t) => t + 1)}
+        onSettingsChanged={() => {
+          setSettingsTick((t) => t + 1);
+          if (activeRoomCode) {
+            checkRoomExists(activeRoomCode).then((exists) => {
+              if (!exists) {
+                saveLastRoomCode(null);
+                setActiveRoomCode(null);
+                setRoomData(null);
+              }
+            });
+          }
+        }}
       />
     </div>
   );

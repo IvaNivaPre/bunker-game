@@ -36,7 +36,10 @@ import {
   getAllBunkerPresets,
   getAllCatastrophePresets,
   getFirebaseConfig,
+  getLastRoomCode,
   getPacksByIds,
+  saveFirebaseConfig,
+  saveLastRoomCode,
 } from './storageService';
 
 export type SyncBackendMode = 'firebase-rtdb' | 'firebase-firestore' | 'local';
@@ -49,6 +52,303 @@ let currentMode: SyncBackendMode = 'local';
 const LOCAL_ROOMS_PREFIX = 'bunker_room_data_';
 const STALE_ROOM_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
+// ============================================================================
+// BUILT-IN CLOUD RELAY (MQTT v3.1.1 over WSS with Retained Room State)
+// Ensures PC <-> Phone room creation & joining by 3-character code works out
+// of the box across devices even if Firebase is not yet configured on a phone.
+// ============================================================================
+const CLOUD_TOPIC_PREFIX = 'bunker_online_v3_ru';
+const CLOUD_BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+];
+
+const cloudRoomsCache = new Map<string, RoomData>();
+const cloudDeletedCodes = new Set<string>();
+const cloudRoomWaiters = new Map<string, Set<(room: RoomData | null) => void>>();
+
+let mqttSocket: WebSocket | null = null;
+let mqttConnected = false;
+let mqttBrokerIdx = 0;
+let mqttPingTimer: number | null = null;
+let mqttReconnectTimer: number | null = null;
+let mqttRxBuffer: Uint8Array = new Uint8Array(0);
+let mqttPacketId = 1;
+const mqttPendingQueue: Uint8Array[] = [];
+
+function encodeRemainingLength(len: number): number[] {
+  const bytes: number[] = [];
+  do {
+    let encodedByte = len % 128;
+    len = Math.floor(len / 128);
+    if (len > 0) encodedByte |= 128;
+    bytes.push(encodedByte);
+  } while (len > 0);
+  return bytes;
+}
+
+function encodeMqttUtf8(str: string): Uint8Array {
+  const utf8 = new TextEncoder().encode(str);
+  const out = new Uint8Array(2 + utf8.length);
+  out[0] = (utf8.length >> 8) & 0xff;
+  out[1] = utf8.length & 0xff;
+  out.set(utf8, 2);
+  return out;
+}
+
+function buildMqttConnectPacket(clientId: string): Uint8Array {
+  const protoName = encodeMqttUtf8('MQTT');
+  const varHeader = new Uint8Array([
+    ...protoName,
+    0x04, // Protocol level 4 (MQTT 3.1.1)
+    0x02, // Clean session
+    0x00,
+    0x3c, // Keep alive 60s
+  ]);
+  const payload = encodeMqttUtf8(clientId);
+  const remLen = varHeader.length + payload.length;
+  const remBytes = encodeRemainingLength(remLen);
+  const pkt = new Uint8Array(1 + remBytes.length + remLen);
+  pkt[0] = 0x10; // CONNECT
+  pkt.set(remBytes, 1);
+  pkt.set(varHeader, 1 + remBytes.length);
+  pkt.set(payload, 1 + remBytes.length + varHeader.length);
+  return pkt;
+}
+
+function buildMqttSubscribePacket(topicFilter: string): Uint8Array {
+  const pid = (mqttPacketId++ & 0x7fff) || 1;
+  const topicBytes = encodeMqttUtf8(topicFilter);
+  const remLen = 2 + topicBytes.length + 1;
+  const remBytes = encodeRemainingLength(remLen);
+  const pkt = new Uint8Array(1 + remBytes.length + remLen);
+  pkt[0] = 0x82; // SUBSCRIBE (QoS 1 header flag)
+  pkt.set(remBytes, 1);
+  const offset = 1 + remBytes.length;
+  pkt[offset] = (pid >> 8) & 0xff;
+  pkt[offset + 1] = pid & 0xff;
+  pkt.set(topicBytes, offset + 2);
+  pkt[offset + 2 + topicBytes.length] = 0x00; // Requested QoS 0
+  return pkt;
+}
+
+function buildMqttPublishPacket(
+  topic: string,
+  payloadStr: string | null,
+  retain = true
+): Uint8Array {
+  const topicBytes = encodeMqttUtf8(topic);
+  const payloadBytes =
+    payloadStr && payloadStr.length > 0
+      ? new TextEncoder().encode(payloadStr)
+      : new Uint8Array(0);
+  const remLen = topicBytes.length + payloadBytes.length;
+  const remBytes = encodeRemainingLength(remLen);
+  const pkt = new Uint8Array(1 + remBytes.length + remLen);
+  pkt[0] = retain ? 0x31 : 0x30; // PUBLISH QoS 0, RETAIN = 1 or 0
+  pkt.set(remBytes, 1);
+  pkt.set(topicBytes, 1 + remBytes.length);
+  pkt.set(payloadBytes, 1 + remBytes.length + topicBytes.length);
+  return pkt;
+}
+
+function sendMqttRaw(pkt: Uint8Array): void {
+  if (mqttSocket && mqttConnected && mqttSocket.readyState === WebSocket.OPEN) {
+    try {
+      mqttSocket.send(pkt);
+      return;
+    } catch {
+      // fall through to queue
+    }
+  }
+  if (mqttPendingQueue.length < 50) {
+    mqttPendingQueue.push(pkt);
+  }
+}
+
+function notifyRoomsChanged(): void {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('bunker-rooms-updated'));
+  }
+}
+
+function handleIncomingCloudRoom(code: string, payloadStr: string): void {
+  const cleanCode = normalizeRoomCode(code);
+  if (!cleanCode || cleanCode.length !== 3) return;
+
+  // Empty retained message means room was deleted
+  if (!payloadStr || !payloadStr.trim()) {
+    cloudRoomsCache.delete(cleanCode);
+    cloudDeletedCodes.add(cleanCode);
+    localStorage.removeItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`);
+    if (normalizeRoomCode(getLastRoomCode() || '') === cleanCode) {
+      saveLastRoomCode(null);
+    }
+    localSubscribers.get(cleanCode)?.forEach((cb) => cb(null));
+    cloudRoomWaiters.get(cleanCode)?.forEach((cb) => cb(null));
+    cloudRoomWaiters.delete(cleanCode);
+    notifyRoomsChanged();
+    return;
+  }
+
+  try {
+    const incoming = JSON.parse(payloadStr) as RoomData;
+    if (!incoming || !incoming.code) return;
+
+    // Auto-adopt Host's Firebase configuration if this device has none
+    if (incoming.firebaseConfig?.apiKey && incoming.firebaseConfig?.projectId) {
+      const existingFb = getFirebaseConfig();
+      if (!existingFb || !existingFb.apiKey) {
+        saveFirebaseConfig(incoming.firebaseConfig);
+        initFirebaseFromStorage();
+      }
+    }
+
+    const existing = cloudRoomsCache.get(cleanCode) || readLocalRoom(cleanCode);
+    if (
+      existing &&
+      (existing.updatedAt || 0) > (incoming.updatedAt || 0)
+    ) {
+      return;
+    }
+
+    cloudDeletedCodes.delete(cleanCode);
+    cloudRoomsCache.set(cleanCode, incoming);
+    localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(incoming));
+    localSubscribers.get(cleanCode)?.forEach((cb) => cb(incoming));
+    cloudRoomWaiters.get(cleanCode)?.forEach((cb) => cb(incoming));
+    cloudRoomWaiters.delete(cleanCode);
+    notifyRoomsChanged();
+  } catch {
+    // ignore malformed packet
+  }
+}
+
+function processMqttBuffer(): void {
+  while (mqttRxBuffer.length >= 2) {
+    const byte0 = mqttRxBuffer[0];
+    const packetType = byte0 >> 4;
+
+    let multiplier = 1;
+    let remLength = 0;
+    let idx = 1;
+    let encodedByte = 0;
+
+    do {
+      if (idx >= mqttRxBuffer.length) return; // wait for more bytes
+      encodedByte = mqttRxBuffer[idx++];
+      remLength += (encodedByte & 127) * multiplier;
+      multiplier *= 128;
+      if (multiplier > 128 * 128 * 128) {
+        mqttRxBuffer = new Uint8Array(0);
+        return;
+      }
+    } while ((encodedByte & 128) !== 0);
+
+    const totalLen = idx + remLength;
+    if (mqttRxBuffer.length < totalLen) return; // wait for full packet
+
+    const body = mqttRxBuffer.slice(idx, totalLen);
+    mqttRxBuffer = mqttRxBuffer.slice(totalLen);
+
+    if (packetType === 2) {
+      // CONNACK
+      mqttConnected = true;
+      // Subscribe to all rooms on the relay
+      sendMqttRaw(buildMqttSubscribePacket(`${CLOUD_TOPIC_PREFIX}/rooms/+`));
+      while (mqttPendingQueue.length > 0) {
+        const nextPkt = mqttPendingQueue.shift();
+        if (nextPkt) sendMqttRaw(nextPkt);
+      }
+    } else if (packetType === 3) {
+      // PUBLISH
+      if (body.length < 2) continue;
+      const topicLen = (body[0] << 8) | body[1];
+      if (body.length < 2 + topicLen) continue;
+      const topic = new TextDecoder().decode(body.slice(2, 2 + topicLen));
+      const qos = (byte0 >> 1) & 0x03;
+      const payloadOffset = 2 + topicLen + (qos > 0 ? 2 : 0);
+      const payloadStr =
+        body.length > payloadOffset
+          ? new TextDecoder().decode(body.slice(payloadOffset))
+          : '';
+
+      const prefix = `${CLOUD_TOPIC_PREFIX}/rooms/`;
+      if (topic.startsWith(prefix)) {
+        const roomCode = topic.slice(prefix.length);
+        handleIncomingCloudRoom(roomCode, payloadStr);
+      }
+    }
+  }
+}
+
+function connectCloudRelay(): void {
+  if (typeof window === 'undefined' || typeof WebSocket === 'undefined') return;
+  if (
+    mqttSocket &&
+    (mqttSocket.readyState === WebSocket.OPEN ||
+      mqttSocket.readyState === WebSocket.CONNECTING)
+  ) {
+    return;
+  }
+
+  const brokerUrl = CLOUD_BROKERS[mqttBrokerIdx % CLOUD_BROKERS.length];
+  try {
+    const ws = new WebSocket(brokerUrl, 'mqtt');
+    ws.binaryType = 'arraybuffer';
+    mqttSocket = ws;
+    mqttConnected = false;
+    mqttRxBuffer = new Uint8Array(0);
+
+    ws.onopen = () => {
+      const clientId = `bunker_${Math.random().toString(36).slice(2, 9)}_${Date.now().toString(36)}`;
+      ws.send(buildMqttConnectPacket(clientId));
+      if (mqttPingTimer) window.clearInterval(mqttPingTimer);
+      mqttPingTimer = window.setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN && mqttConnected) {
+          ws.send(new Uint8Array([0xc0, 0x00])); // PINGREQ
+        }
+      }, 25000);
+    };
+
+    ws.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) {
+        const chunk = new Uint8Array(ev.data);
+        const merged = new Uint8Array(mqttRxBuffer.length + chunk.length);
+        merged.set(mqttRxBuffer, 0);
+        merged.set(chunk, mqttRxBuffer.length);
+        mqttRxBuffer = merged;
+        processMqttBuffer();
+      }
+    };
+
+    const handleDisconnect = () => {
+      mqttConnected = false;
+      if (mqttPingTimer) {
+        window.clearInterval(mqttPingTimer);
+        mqttPingTimer = null;
+      }
+      if (mqttSocket === ws) {
+        mqttSocket = null;
+      }
+      mqttBrokerIdx = (mqttBrokerIdx + 1) % CLOUD_BROKERS.length;
+      if (!mqttReconnectTimer) {
+        mqttReconnectTimer = window.setTimeout(() => {
+          mqttReconnectTimer = null;
+          connectCloudRelay();
+        }, 1800);
+      }
+    };
+
+    ws.onerror = handleDisconnect;
+    ws.onclose = handleDisconnect;
+  } catch {
+    mqttBrokerIdx = (mqttBrokerIdx + 1) % CLOUD_BROKERS.length;
+  }
+}
+
+connectCloudRelay();
+
 const broadcastChannel =
   typeof window !== 'undefined' && 'BroadcastChannel' in window
     ? new BroadcastChannel('bunker_online_rooms_sync')
@@ -59,8 +359,14 @@ const localSubscribers = new Map<string, Set<(room: RoomData | null) => void>>()
 if (broadcastChannel) {
   broadcastChannel.onmessage = (event) => {
     const { code, room } = event.data || {};
-    if (code && localSubscribers.has(code)) {
-      localSubscribers.get(code)?.forEach((cb) => cb(room));
+    if (code) {
+      if (!room && normalizeRoomCode(getLastRoomCode() || '') === code) {
+        saveLastRoomCode(null);
+      }
+      if (localSubscribers.has(code)) {
+        localSubscribers.get(code)?.forEach((cb) => cb(room));
+      }
+      notifyRoomsChanged();
     }
   };
 }
@@ -69,16 +375,61 @@ if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e) => {
     if (e.key && e.key.startsWith(LOCAL_ROOMS_PREFIX)) {
       const code = e.key.replace(LOCAL_ROOMS_PREFIX, '');
+      const room = e.newValue ? (JSON.parse(e.newValue) as RoomData) : null;
+      if (!room && normalizeRoomCode(getLastRoomCode() || '') === code) {
+        saveLastRoomCode(null);
+      }
       if (localSubscribers.has(code)) {
-        const room = e.newValue ? (JSON.parse(e.newValue) as RoomData) : null;
         localSubscribers.get(code)?.forEach((cb) => cb(room));
       }
+      notifyRoomsChanged();
     }
   });
 }
 
+// Cyrillic homoglyphs & keyboard layout fallback so Russian input on mobile/PC works seamlessly
+const CYRILLIC_TO_LATIN_MAP: Record<string, string> = {
+  А: 'A',
+  В: 'B',
+  Е: 'E',
+  К: 'K',
+  М: 'M',
+  Н: 'H',
+  О: 'O',
+  Р: 'P',
+  С: 'C',
+  Т: 'T',
+  У: 'Y',
+  Х: 'X',
+  З: '3',
+  Ч: '4',
+  Б: '6',
+  Й: 'Q',
+  Ц: 'W',
+  Г: 'U',
+  Ш: 'I',
+  Щ: 'O',
+  Ф: 'A',
+  Ы: 'S',
+  П: 'G',
+  Л: 'L',
+  Д: 'D',
+  Ж: 'V',
+  Э: 'E',
+  Я: 'Z',
+  И: 'B',
+  Ь: 'M',
+  Ю: 'U',
+};
+
 export function normalizeRoomCode(code: string): string {
-  return (code || '').trim().replace(/\s+/g, '').toUpperCase();
+  const upper = (code || '').trim().replace(/\s+/g, '').toUpperCase();
+  let converted = '';
+  for (let i = 0; i < upper.length; i++) {
+    const ch = upper[i];
+    converted += CYRILLIC_TO_LATIN_MAP[ch] || ch;
+  }
+  return converted.replace(/[^A-Z0-9]/g, '');
 }
 
 function formatTimeNow(): string {
@@ -86,6 +437,21 @@ function formatTimeNow(): string {
   const hh = String(now.getHours()).padStart(2, '0');
   const mm = String(now.getMinutes()).padStart(2, '0');
   return `${hh}:${mm}`;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, fallbackVal: T): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallbackVal), ms);
+    promise
+      .then((val) => {
+        clearTimeout(timer);
+        resolve(val);
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        resolve(fallbackVal);
+      });
+  });
 }
 
 export function initFirebaseFromStorage(): {
@@ -106,16 +472,35 @@ export function initFirebaseFromStorage(): {
       deleteApp(app).catch(() => {});
     }
 
-    firebaseApp = initializeApp(config);
+    const effectiveConfig: FirebaseConfig = {
+      ...config,
+      databaseURL:
+        config.databaseURL ||
+        `https://${config.projectId}-default-rtdb.firebaseio.com`,
+    };
 
-    if (config.databaseURL) {
+    firebaseApp = initializeApp(effectiveConfig);
+
+    try {
       rtdbInstance = getDatabase(firebaseApp);
+    } catch {
+      rtdbInstance = null;
+    }
+
+    try {
+      firestoreInstance = getFirestore(firebaseApp);
+    } catch {
       firestoreInstance = null;
+    }
+
+    if (config.databaseURL && rtdbInstance) {
+      currentMode = 'firebase-rtdb';
+    } else if (firestoreInstance) {
+      currentMode = 'firebase-firestore';
+    } else if (rtdbInstance) {
       currentMode = 'firebase-rtdb';
     } else {
-      firestoreInstance = getFirestore(firebaseApp);
-      rtdbInstance = null;
-      currentMode = 'firebase-firestore';
+      currentMode = 'local';
     }
 
     // Automatically clean up rooms inactive for >24h
@@ -143,34 +528,69 @@ export async function testFirebaseConnection(
 ): Promise<{ ok: boolean; mode: SyncBackendMode; message: string }> {
   let testApp: FirebaseApp | null = null;
   try {
-    testApp = initializeApp(config, `test_app_${Date.now()}`);
+    const effectiveConfig: FirebaseConfig = {
+      ...config,
+      databaseURL:
+        config.databaseURL ||
+        `https://${config.projectId}-default-rtdb.firebaseio.com`,
+    };
+    testApp = initializeApp(effectiveConfig, `test_app_${Date.now()}`);
+
     if (config.databaseURL) {
-      const db = getDatabase(testApp);
-      const pingRef = ref(db, `_connection_test/ping`);
-      await set(pingRef, { timestamp: Date.now(), status: 'ok' });
-      const snap = await get(pingRef);
-      await deleteApp(testApp);
-      if (snap.exists()) {
-        return {
-          ok: true,
-          mode: 'firebase-rtdb',
-          message: `Realtime Database подключена успешно (${config.projectId})!`,
-        };
+      try {
+        const db = getDatabase(testApp);
+        const pingRef = ref(db, `_connection_test/ping`);
+        await set(pingRef, { timestamp: Date.now(), status: 'ok' });
+        const snap = await get(pingRef);
+        if (snap.exists()) {
+          await deleteApp(testApp);
+          return {
+            ok: true,
+            mode: 'firebase-rtdb',
+            message: `Realtime Database подключена успешно (${config.projectId})!`,
+          };
+        }
+      } catch (rtdbErr) {
+        console.warn('RTDB test failed, trying Firestore...', rtdbErr);
       }
-    } else {
+    }
+
+    try {
       const fs = getFirestore(testApp);
       const pingDoc = doc(fs, '_connection_test', 'ping');
       await setDoc(pingDoc, { timestamp: Date.now(), status: 'ok' });
       const snap = await getDoc(pingDoc);
-      await deleteApp(testApp);
       if (snap.exists()) {
+        await deleteApp(testApp);
         return {
           ok: true,
           mode: 'firebase-firestore',
           message: `Cloud Firestore подключен успешно (${config.projectId})!`,
         };
       }
+    } catch (fsErr) {
+      if (!config.databaseURL) {
+        try {
+          const db = getDatabase(testApp);
+          const pingRef = ref(db, `_connection_test/ping`);
+          await set(pingRef, { timestamp: Date.now(), status: 'ok' });
+          const snap = await get(pingRef);
+          if (snap.exists()) {
+            await deleteApp(testApp);
+            return {
+              ok: true,
+              mode: 'firebase-rtdb',
+              message: `Realtime Database подключена успешно (${config.projectId})!`,
+            };
+          }
+        } catch {
+          // ignore
+        }
+      }
+      throw fsErr;
     }
+
+    await deleteApp(testApp);
     return {
       ok: false,
       mode: 'local',
@@ -203,99 +623,217 @@ function readLocalRoom(cleanCode: string): RoomData | null {
   }
 }
 
+function waitForCloudRoom(cleanCode: string, timeoutMs = 2200): Promise<RoomData | null> {
+  if (cloudRoomsCache.has(cleanCode)) {
+    return Promise.resolve(cloudRoomsCache.get(cleanCode) || null);
+  }
+  if (cloudDeletedCodes.has(cleanCode)) {
+    return Promise.resolve(null);
+  }
+  connectCloudRelay();
+  sendMqttRaw(buildMqttSubscribePacket(`${CLOUD_TOPIC_PREFIX}/rooms/${cleanCode}`));
+
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(() => {
+      cloudRoomWaiters.get(cleanCode)?.delete(onFound);
+      resolve(cloudRoomsCache.get(cleanCode) || null);
+    }, timeoutMs);
+
+    const onFound = (room: RoomData | null) => {
+      window.clearTimeout(timer);
+      resolve(room);
+    };
+
+    if (!cloudRoomWaiters.has(cleanCode)) {
+      cloudRoomWaiters.set(cleanCode, new Set());
+    }
+    cloudRoomWaiters.get(cleanCode)!.add(onFound);
+  });
+}
+
 /**
- * Safely reads room data from Firebase (`rooms/${roomCode}`) with graceful 404 / null handling
- * and local fallback so joining by code never triggers false crashes.
+ * Safely reads room data across Local cache, Cloud Relay, Firebase RTDB, and Firestore
+ * so joining by 3-char code works reliably across devices and browsers.
  */
 async function readRoomRaw(code: string): Promise<RoomData | null> {
   const cleanCode = normalizeRoomCode(code);
   if (!cleanCode) return null;
 
-  if (currentMode === 'firebase-rtdb' && rtdbInstance) {
-    try {
-      const snap = await get(ref(rtdbInstance, `rooms/${cleanCode}`));
-      if (snap.exists()) {
-        return snap.val() as RoomData;
-      }
-    } catch (err) {
-      console.warn(`RTDB read for rooms/${cleanCode} failed, checking local fallback:`, err);
+  // 1. Check immediate local / cloud memory cache first
+  const localImmediate = readLocalRoom(cleanCode) || cloudRoomsCache.get(cleanCode) || null;
+
+  // 2. Try Firebase RTDB if initialized
+  if (rtdbInstance && (currentMode === 'firebase-rtdb' || currentMode === 'firebase-firestore')) {
+    const rtdbRoom = await withTimeout<RoomData | null>(
+      get(ref(rtdbInstance, `rooms/${cleanCode}`)).then((snap) =>
+        snap.exists() ? (snap.val() as RoomData) : null
+      ),
+      2500,
+      null
+    );
+    if (rtdbRoom && rtdbRoom.code) {
+      cloudRoomsCache.set(cleanCode, rtdbRoom);
+      localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(rtdbRoom));
+      return rtdbRoom;
     }
   }
 
-  if (currentMode === 'firebase-firestore' && firestoreInstance) {
-    try {
-      const snap = await getDoc(doc(firestoreInstance, 'rooms', cleanCode));
-      if (snap.exists()) {
-        return snap.data() as RoomData;
-      }
-    } catch (err) {
-      console.warn(`Firestore read for rooms/${cleanCode} failed, checking local fallback:`, err);
+  // 3. Try Firebase Firestore if initialized
+  if (firestoreInstance && (currentMode === 'firebase-firestore' || currentMode === 'firebase-rtdb')) {
+    const fsRoom = await withTimeout<RoomData | null>(
+      getDoc(doc(firestoreInstance, 'rooms', cleanCode)).then((snap) =>
+        snap.exists() ? (snap.data() as RoomData) : null
+      ),
+      2500,
+      null
+    );
+    if (fsRoom && fsRoom.code) {
+      cloudRoomsCache.set(cleanCode, fsRoom);
+      localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(fsRoom));
+      return fsRoom;
     }
+  }
+
+  if (localImmediate) {
+    return localImmediate;
+  }
+
+  // 4. Query Cloud Relay for rooms created on another device (PC <-> Phone)
+  const cloudRoom = await waitForCloudRoom(cleanCode, 2200);
+  if (cloudRoom) {
+    return cloudRoom;
   }
 
   return readLocalRoom(cleanCode);
 }
 
+export async function checkRoomExists(code: string): Promise<boolean> {
+  const cleanCode = normalizeRoomCode(code);
+  if (!cleanCode || cleanCode.length !== 3) return false;
+  if (cloudDeletedCodes.has(cleanCode)) return false;
+  const room = await readRoomRaw(cleanCode);
+  return Boolean(room && room.code);
+}
+
 async function writeRoomRaw(code: string, room: RoomData): Promise<void> {
   const cleanCode = normalizeRoomCode(code);
+  const activeFbConfig = getFirebaseConfig();
   const payload = sanitizeForFirebase({
     ...room,
     code: cleanCode,
     updatedAt: Date.now(),
+    ...(activeFbConfig?.apiKey && activeFbConfig?.projectId
+      ? { firebaseConfig: activeFbConfig }
+      : {}),
   });
 
+  cloudDeletedCodes.delete(cleanCode);
+  cloudRoomsCache.set(cleanCode, payload);
   localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(payload));
   broadcastChannel?.postMessage({ code: cleanCode, room: payload });
   localSubscribers.get(cleanCode)?.forEach((cb) => cb(payload));
+  notifyRoomsChanged();
 
-  if (currentMode === 'firebase-rtdb' && rtdbInstance) {
-    await set(ref(rtdbInstance, `rooms/${cleanCode}`), payload);
-  } else if (currentMode === 'firebase-firestore' && firestoreInstance) {
-    await setDoc(doc(firestoreInstance, 'rooms', cleanCode), payload);
+  // Publish retained room state to Cloud Relay for instant cross-device sync
+  connectCloudRelay();
+  sendMqttRaw(
+    buildMqttPublishPacket(
+      `${CLOUD_TOPIC_PREFIX}/rooms/${cleanCode}`,
+      JSON.stringify(payload),
+      true
+    )
+  );
+
+  // Write to Firebase (non-blocking timeout so UI never hangs)
+  const writes: Promise<unknown>[] = [];
+  if (rtdbInstance && currentMode === 'firebase-rtdb') {
+    writes.push(
+      withTimeout(set(ref(rtdbInstance, `rooms/${cleanCode}`), payload), 3000, undefined)
+    );
+  }
+  if (firestoreInstance && currentMode === 'firebase-firestore') {
+    writes.push(
+      withTimeout(
+        setDoc(doc(firestoreInstance, 'rooms', cleanCode), payload),
+        3000,
+        undefined
+      )
+    );
+  }
+  if (writes.length > 0) {
+    await Promise.all(writes);
   }
 }
 
 /**
- * Completely deletes a room from Firebase and localStorage (on game end or Admin termination)
+ * Completely deletes a room from Firebase, Cloud Relay, and localStorage (on game end or Admin termination)
  */
 export async function deleteRoomCompletely(code: string): Promise<void> {
   const cleanCode = normalizeRoomCode(code);
   if (!cleanCode) return;
 
+  cloudDeletedCodes.add(cleanCode);
+  cloudRoomsCache.delete(cleanCode);
   localStorage.removeItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`);
+
+  // Clear "Return to active game" code if it matches the deleted room
+  if (normalizeRoomCode(getLastRoomCode() || '') === cleanCode) {
+    saveLastRoomCode(null);
+  }
+
   broadcastChannel?.postMessage({ code: cleanCode, room: null });
   localSubscribers.get(cleanCode)?.forEach((cb) => cb(null));
+  notifyRoomsChanged();
 
-  if (currentMode === 'firebase-rtdb' && rtdbInstance) {
-    try {
-      await remove(ref(rtdbInstance, `rooms/${cleanCode}`));
-    } catch (err) {
-      console.warn('Error removing room from RTDB:', err);
-    }
-  } else if (currentMode === 'firebase-firestore' && firestoreInstance) {
-    try {
-      await deleteDoc(doc(firestoreInstance, 'rooms', cleanCode));
-    } catch (err) {
-      console.warn('Error removing room from Firestore:', err);
-    }
+  // Clear retained room message on Cloud Relay
+  connectCloudRelay();
+  sendMqttRaw(
+    buildMqttPublishPacket(`${CLOUD_TOPIC_PREFIX}/rooms/${cleanCode}`, null, true)
+  );
+
+  const removals: Promise<unknown>[] = [];
+  if (rtdbInstance) {
+    removals.push(
+      withTimeout(remove(ref(rtdbInstance, `rooms/${cleanCode}`)), 2500, undefined)
+    );
+  }
+  if (firestoreInstance) {
+    removals.push(
+      withTimeout(deleteDoc(doc(firestoreInstance, 'rooms', cleanCode)), 2500, undefined)
+    );
+  }
+  if (removals.length > 0) {
+    await Promise.all(removals);
   }
 }
 
 /**
- * Lists all active rooms across Firebase and localStorage
+ * Lists all active rooms across LocalStorage, Cloud Relay, and Firebase
  */
 export async function listAllActiveRooms(): Promise<RoomData[]> {
   const roomsMap = new Map<string, RoomData>();
 
-  // 1. Collect from localStorage
+  // 1. Collect from Cloud Relay cache
+  for (const [code, room] of cloudRoomsCache.entries()) {
+    const clean = normalizeRoomCode(code);
+    if (room && room.code && !cloudDeletedCodes.has(clean)) {
+      roomsMap.set(clean, room);
+    }
+  }
+
+  // 2. Collect from localStorage
   if (typeof window !== 'undefined') {
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
       if (k && k.startsWith(LOCAL_ROOMS_PREFIX)) {
         try {
           const val = JSON.parse(localStorage.getItem(k) || '') as RoomData;
-          if (val && val.code) {
-            roomsMap.set(normalizeRoomCode(val.code), val);
+          const clean = normalizeRoomCode(val?.code || '');
+          if (val && clean && !cloudDeletedCodes.has(clean)) {
+            const prev = roomsMap.get(clean);
+            if (!prev || (val.updatedAt || 0) >= (prev.updatedAt || 0)) {
+              roomsMap.set(clean, val);
+            }
           }
         } catch {
           // ignore
@@ -304,32 +842,32 @@ export async function listAllActiveRooms(): Promise<RoomData[]> {
     }
   }
 
-  // 2. Collect from Firebase
+  // 3. Collect from Firebase
   if (currentMode === 'firebase-rtdb' && rtdbInstance) {
-    try {
-      const snap = await get(ref(rtdbInstance, 'rooms'));
-      if (snap.exists()) {
-        const data = snap.val() as Record<string, RoomData>;
-        for (const [code, room] of Object.entries(data)) {
-          if (room && room.code) {
-            roomsMap.set(normalizeRoomCode(code), room);
-          }
+    const snap = await withTimeout(get(ref(rtdbInstance, 'rooms')), 2500, null);
+    if (snap && snap.exists()) {
+      const data = snap.val() as Record<string, RoomData>;
+      for (const [code, room] of Object.entries(data)) {
+        const clean = normalizeRoomCode(code);
+        if (room && room.code && !cloudDeletedCodes.has(clean)) {
+          roomsMap.set(clean, room);
         }
       }
-    } catch (err) {
-      console.warn('Could not list RTDB rooms:', err);
     }
   } else if (currentMode === 'firebase-firestore' && firestoreInstance) {
-    try {
-      const snap = await getDocs(collection(firestoreInstance, 'rooms'));
+    const snap = await withTimeout(
+      getDocs(collection(firestoreInstance, 'rooms')),
+      2500,
+      null
+    );
+    if (snap) {
       snap.forEach((docSnap) => {
         const room = docSnap.data() as RoomData;
-        if (room && room.code) {
-          roomsMap.set(normalizeRoomCode(room.code), room);
+        const clean = normalizeRoomCode(room?.code || '');
+        if (room && clean && !cloudDeletedCodes.has(clean)) {
+          roomsMap.set(clean, room);
         }
       });
-    } catch (err) {
-      console.warn('Could not list Firestore rooms:', err);
     }
   }
 
@@ -364,58 +902,64 @@ export function subscribeToRoom(
 ): () => void {
   const cleanCode = normalizeRoomCode(code);
 
-  if (currentMode === 'firebase-rtdb' && rtdbInstance) {
-    const roomRef = ref(rtdbInstance, `rooms/${cleanCode}`);
-    const unsubscribe = onValue(
-      roomRef,
-      (snapshot) => {
-        if (snapshot.exists()) {
-          const val = snapshot.val() as RoomData;
-          localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(val));
-          onUpdate(val);
-        } else {
-          onUpdate(null);
-        }
-      },
-      (error) => {
-        console.error('RTDB subscription error:', error);
-        onUpdate(readLocalRoom(cleanCode));
-      }
-    );
-    return () => unsubscribe();
-  }
-
-  if (currentMode === 'firebase-firestore' && firestoreInstance) {
-    const roomDoc = doc(firestoreInstance, 'rooms', cleanCode);
-    const unsubscribe = onSnapshot(
-      roomDoc,
-      (snapshot) => {
-        if (snapshot.exists()) {
-          const val = snapshot.data() as RoomData;
-          localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(val));
-          onUpdate(val);
-        } else {
-          onUpdate(null);
-        }
-      },
-      (error) => {
-        console.error('Firestore subscription error:', error);
-        onUpdate(readLocalRoom(cleanCode));
-      }
-    );
-    return () => unsubscribe();
-  }
-
-  // Local mode subscription
+  // Always register in localSubscribers so Cloud Relay & BroadcastChannel updates arrive immediately
   if (!localSubscribers.has(cleanCode)) {
     localSubscribers.set(cleanCode, new Set());
   }
   localSubscribers.get(cleanCode)!.add(onUpdate);
 
-  readRoomRaw(cleanCode).then((data) => onUpdate(data));
+  connectCloudRelay();
+  sendMqttRaw(buildMqttSubscribePacket(`${CLOUD_TOPIC_PREFIX}/rooms/${cleanCode}`));
+
+  let fbUnsubscribe: (() => void) | null = null;
+
+  if (currentMode === 'firebase-rtdb' && rtdbInstance) {
+    const roomRef = ref(rtdbInstance, `rooms/${cleanCode}`);
+    fbUnsubscribe = onValue(
+      roomRef,
+      (snapshot) => {
+        if (snapshot.exists()) {
+          const val = snapshot.val() as RoomData;
+          cloudRoomsCache.set(cleanCode, val);
+          localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(val));
+          onUpdate(val);
+        } else if (cloudDeletedCodes.has(cleanCode)) {
+          onUpdate(null);
+        }
+      },
+      (error) => {
+        console.error('RTDB subscription error:', error);
+      }
+    );
+  } else if (currentMode === 'firebase-firestore' && firestoreInstance) {
+    const roomDoc = doc(firestoreInstance, 'rooms', cleanCode);
+    fbUnsubscribe = onSnapshot(
+      roomDoc,
+      (snapshot) => {
+        if (snapshot.exists()) {
+          const val = snapshot.data() as RoomData;
+          cloudRoomsCache.set(cleanCode, val);
+          localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(val));
+          onUpdate(val);
+        } else if (cloudDeletedCodes.has(cleanCode)) {
+          onUpdate(null);
+        }
+      },
+      (error) => {
+        console.error('Firestore subscription error:', error);
+      }
+    );
+  }
+
+  readRoomRaw(cleanCode).then((data) => {
+    if (data || cloudDeletedCodes.has(cleanCode)) {
+      onUpdate(data);
+    }
+  });
 
   return () => {
     localSubscribers.get(cleanCode)?.delete(onUpdate);
+    if (fbUnsubscribe) fbUnsubscribe();
   };
 }
 
@@ -528,10 +1072,19 @@ export async function joinRoom(
     throw new Error('Введите корректный 3-значный код комнаты (например: 7A2).');
   }
 
-  const room = await readRoomRaw(cleanCode);
+  let room = await readRoomRaw(cleanCode);
   if (!room) {
+    const allRooms = await listAllActiveRooms();
+    room = allRooms.find((r) => normalizeRoomCode(r.code) === cleanCode) || null;
+  }
+
+  if (!room) {
+    if (normalizeRoomCode(getLastRoomCode() || '') === cleanCode) {
+      saveLastRoomCode(null);
+      notifyRoomsChanged();
+    }
     throw new Error(
-      `Комната с кодом «${cleanCode}» не найдена (404). Проверьте правильность кода или настройки Firebase.`
+      `Комната с кодом «${cleanCode}» не найдена. Проверьте правильность 3-значного кода комнаты.`
     );
   }
 
