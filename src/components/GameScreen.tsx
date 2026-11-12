@@ -17,10 +17,10 @@ import {
   Gavel,
   Send,
   AlertTriangle,
-  Sparkles,
   UserCheck,
   UserX,
   RotateCcw,
+  DoorOpen,
 } from 'lucide-react';
 import {
   ATTRIBUTE_METADATA,
@@ -34,13 +34,13 @@ import {
   advanceTurn,
   castVote,
   finalizeVoting,
-  regenerateRoomFinale,
   removeOrLeavePlayer,
   resetOrSetTimer,
   revealAttribute,
   startRevoteAfterDefense,
   startVoting,
   transferHost,
+  triggerStandardFinale,
 } from '../services/firebaseService';
 import { AbilitySheetModal } from './AbilitySheetModal';
 import { sound } from '../services/soundService';
@@ -58,6 +58,9 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
   const [chatInput, setChatInput] = useState<string>('');
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // Track which exile modal IDs have been dismissed by the user via "ОК"
+  const [dismissedExileId, setDismissedExileId] = useState<string | null>(null);
+
   // Ability sheet modal state
   const [abilityModal, setAbilityModal] = useState<{
     isOpen: boolean;
@@ -74,7 +77,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
   const isHost =
     room.hostId === currentUserUid || Boolean(currentPlayer?.isHost);
 
-  // Automatically switch to 'voting' tab when status becomes VOTING, TIE_DEFENSE, or REVOTE
   useEffect(() => {
     if (
       room.status === 'VOTING' ||
@@ -86,7 +88,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
     }
   }, [room.status]);
 
-  // Countdown timer sync
   useEffect(() => {
     if (!room.timerEndAt) {
       setTimeLeft(null);
@@ -141,12 +142,17 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
   const eligibleVoters = alivePlayers.filter((p) => !p.voteModifiers?.voteBlocked);
   const totalVotesCast = Object.keys(votesMap).length;
   const myVotedTargetUid = votesMap[currentUserUid];
-
   const turnPlayer = room.currentTurnUid ? room.players[room.currentTurnUid] : null;
+
+  // Show Exile Notification Modal if there is a new exile result not yet dismissed
+  const activeExileModal =
+    room.lastExileResult && room.lastExileResult.id !== dismissedExileId
+      ? room.lastExileResult
+      : null;
 
   return (
     <div className="max-w-6xl mx-auto px-3 sm:px-6 pt-3 pb-24 space-y-4">
-      {/* Top Status Strip: Round, Phase, Active Turn, Timer & Quick Host Bar */}
+      {/* Top Status Strip */}
       <div className="p-3.5 rounded-2xl bg-bunker-900 border border-bunker-700 shadow-lg flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3 flex-wrap">
           <div className="px-3 py-1.5 rounded-xl bg-amber-500/15 border border-amber-500/40 font-mono text-xs font-bold text-amber-300">
@@ -180,7 +186,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
           </div>
         </div>
 
-        {/* Countdown Timer & Host Quick Controls */}
         <div className="flex items-center gap-2.5">
           {timeLeft !== null && (
             <div
@@ -217,7 +222,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
       {currentPlayer && !currentPlayer.isAlive && (
         <div className="p-3 rounded-xl bg-red-500/15 border border-red-500/40 text-xs text-red-200 flex items-center justify-between">
           <span>
-            🚪 Вы были изгнаны из бункера и находитесь в режиме <strong>«Наблюдатель»</strong>. Вы видите ход игры и дождётесь финального вердикта ИИ.
+            🚪 Вы были изгнаны из бункера и находитесь в статусе <strong>«Наблюдатель»</strong>. Вы можете следить за ходом игры и итогами голосования.
           </span>
         </div>
       )}
@@ -231,7 +236,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
         </div>
       )}
 
-      {/* Desktop Top Navigation Bar (mirrors mobile Bottom Navigation) */}
+      {/* Desktop Top Navigation Bar */}
       <div className="hidden sm:grid sm:grid-cols-5 gap-2 bg-bunker-900 p-1.5 rounded-2xl border border-bunker-700">
         {[
           { id: 'my-card', label: '1. Моя карта (11)', icon: User },
@@ -323,7 +328,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                   }`}
                 >
                   <div className="space-y-2">
-                    {/* Top Row: Category Badge, Ability ℹ️ Button, and Reveal Status */}
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-2">
                         <span className="w-5 h-5 rounded-md bg-bunker-800 text-zinc-400 font-mono text-[11px] flex items-center justify-center">
@@ -333,7 +337,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                           {meta.label}
                         </span>
 
-                        {/* Pulsing Interactive Info Icon ℹ️ next to Profession, Hobby & Special Card */}
                         {hasAbility && card.ability && (
                           <button
                             type="button"
@@ -370,7 +373,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                       )}
                     </div>
 
-                    {/* Card Main Text */}
                     <div className="text-sm sm:text-base font-bold text-zinc-100 leading-snug">
                       {card.text}
                     </div>
@@ -380,7 +382,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                     )}
                   </div>
 
-                  {/* Bottom Action Row: Reveal button & Ability quick button */}
                   <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-bunker-800/80">
                     {!card.revealed && meta.key !== 'specialCard' ? (
                       <button
@@ -431,11 +432,10 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
       )}
 
       {/* ===================================================================== */}
-      {/* TAB 2: БУНКЕР (КАТАСТРОФА, ЗАПАСЫ, ТАЙМЕР И УПРАВЛЕНИЕ РАУНДОМ)       */}
+      {/* TAB 2: БУНКЕР                                                         */}
       {/* ===================================================================== */}
       {activeTab === 'bunker' && (
         <div className="space-y-4">
-          {/* Catastrophe Alert Card */}
           <div className="p-5 rounded-2xl bg-gradient-to-br from-red-950/40 via-bunker-900 to-bunker-900 border-2 border-red-500/40 space-y-2">
             <div className="flex items-center gap-2 text-xs font-mono uppercase tracking-widest text-red-400">
               <ShieldAlert className="w-4 h-4" />
@@ -446,7 +446,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
             </p>
           </div>
 
-          {/* Bunker Metrics Grid */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <div className="p-4 rounded-2xl bg-bunker-900 border border-bunker-700">
               <div className="text-xs font-mono text-zinc-400 uppercase">Вместимость</div>
@@ -485,7 +484,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
             </div>
           </div>
 
-          {/* Supplies & Equipment */}
           <div className="p-5 rounded-2xl bg-bunker-900 border border-bunker-700 space-y-2">
             <div className="text-xs font-mono uppercase tracking-wider text-emerald-400">
               ЧТО ЕСТЬ В БУНКЕРЕ (ОБОРУДОВАНИЕ, ЗАПАСЫ И МОДЕРНИЗАЦИИ):
@@ -493,9 +491,11 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
             <p className="text-sm sm:text-base text-zinc-200 leading-relaxed">
               {room.settings.supplies}
             </p>
+            <div className="text-xs font-mono text-zinc-500 pt-1">
+              Используемые паки: {(room.settings.packNames || []).join(', ') || 'Базовый'}
+            </div>
           </div>
 
-          {/* Host Controls Panel */}
           {isHost && (
             <div className="p-4 sm:p-5 rounded-2xl bg-bunker-950 border border-amber-500/40 space-y-3">
               <div className="text-xs font-mono uppercase text-amber-400 flex items-center gap-1.5">
@@ -541,11 +541,11 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                 </button>
                 <button
                   type="button"
-                  onClick={() => regenerateRoomFinale(room.code)}
+                  onClick={() => triggerStandardFinale(room.code)}
                   className="px-3.5 py-2 rounded-xl bg-amber-500/20 border border-amber-500/40 text-amber-300 text-xs font-mono flex items-center gap-1.5"
                 >
-                  <Sparkles className="w-3.5 h-3.5" />
-                  Досрочный Финал ИИ
+                  <Lock className="w-3.5 h-3.5" />
+                  Завершить отбор (Финал)
                 </button>
               </div>
             </div>
@@ -554,7 +554,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
       )}
 
       {/* ===================================================================== */}
-      {/* TAB 3: ВЫЖИВШИЕ (ОБЩАЯ СВОДКА СТОЛА И ВСКРЫТЫЕ ХАРАКТЕРИСТИКИ)        */}
+      {/* TAB 3: ВЫЖИВШИЕ                                                       */}
       {/* ===================================================================== */}
       {activeTab === 'survivors' && (
         <div className="space-y-4">
@@ -585,7 +585,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                       : 'bg-bunker-900 border-bunker-700'
                   }`}
                 >
-                  {/* Player Header */}
                   <div className="flex items-center justify-between gap-2 border-b border-bunker-800 pb-2.5">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="text-base font-bold text-zinc-100">
@@ -613,7 +612,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                         </span>
                       ) : (
                         <span className="text-xs font-mono text-red-400 bg-red-500/15 px-2.5 py-0.5 rounded-full border border-red-500/30">
-                          Изгнан
+                          Изгнан (Наблюдатель)
                         </span>
                       )}
 
@@ -642,7 +641,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                     </div>
                   </div>
 
-                  {/* Attributes List */}
                   <div className="grid grid-cols-1 gap-1.5 text-xs">
                     {ATTRIBUTE_METADATA.filter((m) => m.key !== 'specialCard').map((meta) => {
                       const card = player.attributes[meta.key];
@@ -704,7 +702,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
       )}
 
       {/* ===================================================================== */}
-      {/* TAB 4: ГОЛОСОВАНИЕ (ТРИБУНАЛ, ОПРАВДАТЕЛЬНЫЕ РЕЧИ 30 СЕК, ПЕРЕГОЛОСОВКА) */}
+      {/* TAB 4: ГОЛОСОВАНИЕ                                                    */}
       {/* ===================================================================== */}
       {activeTab === 'voting' && (
         <div className="space-y-4">
@@ -731,7 +729,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
               )}
             </div>
           ) : room.status === 'TIE_DEFENSE' ? (
-            /* 30-SECOND DEFENSE SPEECH PHASE ON TIE */
             <div className="p-6 rounded-2xl bg-amber-500/10 border-2 border-amber-500 space-y-5 text-center">
               <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-amber-500 text-bunker-950 font-mono font-black text-xs uppercase">
                 <AlertTriangle className="w-4 h-4" />
@@ -772,7 +769,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
               )}
             </div>
           ) : (
-            /* ACTIVE VOTING OR REVOTE */
             <div className="space-y-4">
               <div className="p-4 rounded-2xl bg-red-950/30 border border-red-500/40 flex flex-wrap items-center justify-between gap-3">
                 <div>
@@ -812,7 +808,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                 )}
               </div>
 
-              {/* Candidate Cards */}
               <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
                 {alivePlayers.map((candidate) => {
                   const isEligibleTarget =
@@ -900,7 +895,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
       )}
 
       {/* ===================================================================== */}
-      {/* TAB 5: ЖУРНАЛ СОБЫТИЙ И ЧАТ БУНКЕРА                                   */}
+      {/* TAB 5: ЖУРНАЛ СОБЫТИЙ                                                 */}
       {/* ===================================================================== */}
       {activeTab === 'logs' && (
         <div className="p-4 sm:p-5 rounded-2xl bg-bunker-900 border border-bunker-700 space-y-4">
@@ -933,7 +928,6 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
               ))}
           </div>
 
-          {/* Quick Chat Input */}
           <form onSubmit={handleSendChat} className="flex gap-2">
             <input
               type="text"
@@ -954,7 +948,7 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
       )}
 
       {/* ===================================================================== */}
-      {/* MOBILE-FIRST BOTTOM NAVIGATION BAR (FIXED ON SMARTPHONES)             */}
+      {/* MOBILE-FIRST BOTTOM NAVIGATION BAR                                    */}
       {/* ===================================================================== */}
       <nav className="sm:hidden fixed bottom-0 left-0 right-0 z-40 bg-bunker-950/95 backdrop-blur-md border-t border-bunker-700 px-1 py-1.5 grid grid-cols-5 gap-1">
         {[
@@ -998,7 +992,96 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
         })}
       </nav>
 
-      {/* Interactive Ability Sheet Modal (Bottom Sheet on mobile / Popover on PC) */}
+      {/* ===================================================================== */}
+      {/* EXILE NOTIFICATION MODAL DIALOG AFTER VOTING (Section 4)              */}
+      {/* ===================================================================== */}
+      {activeExileModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md p-4 animate-fadeIn">
+          <div className="max-w-lg w-full bg-bunker-900 border-2 border-red-500 rounded-2xl p-6 space-y-5 shadow-2xl">
+            <div className="flex items-center gap-3 text-red-400 border-b border-bunker-700 pb-3">
+              <div className="w-11 h-11 rounded-xl bg-red-500/15 border border-red-500/40 flex items-center justify-center shrink-0">
+                <DoorOpen className="w-6 h-6" />
+              </div>
+              <div>
+                <span className="text-xs font-mono uppercase tracking-wider text-red-400 block">
+                  ИТОГИ ТРИБУНАЛА • РАУНД {activeExileModal.round}
+                </span>
+                <h3 className="text-lg font-extrabold text-zinc-100">
+                  Решение совета выживших
+                </h3>
+              </div>
+            </div>
+
+            <div className="p-4 rounded-xl bg-red-500/15 border border-red-500/40 text-center space-y-1">
+              <p className="text-sm sm:text-base font-bold text-zinc-100">
+                Большинством голосов из бункера был изгнан:{' '}
+                <span className="text-red-300 underline">
+                  {activeExileModal.exiledName}
+                </span>
+              </p>
+              <p className="text-xs font-mono text-zinc-400">
+                Голосов против кандидата: {activeExileModal.maxVotes} • Переведён в статус «Наблюдатель»
+              </p>
+            </div>
+
+            {/* Vote Summary Breakdown */}
+            <div className="space-y-2">
+              <div className="text-xs font-mono uppercase text-amber-400">
+                Сводка голосов:
+              </div>
+              <div className="p-3 rounded-xl bg-bunker-950 border border-bunker-800 space-y-1.5 max-h-44 overflow-y-auto text-xs">
+                {Object.entries(activeExileModal.tally || {})
+                  .sort((a, b) => b[1] - a[1])
+                  .map(([candUid, count]) => {
+                    const candName =
+                      room.players?.[candUid]?.name || 'Участник';
+                    return (
+                      <div
+                        key={candUid}
+                        className="flex items-center justify-between py-1 border-b border-bunker-900 last:border-0"
+                      >
+                        <span className="font-semibold text-zinc-200">
+                          {candName}
+                        </span>
+                        <span className="font-mono text-amber-400 font-bold">
+                          {count} гол.
+                        </span>
+                      </div>
+                    );
+                  })}
+
+                {Object.keys(activeExileModal.voterChoices || {}).length > 0 && (
+                  <div className="pt-2 mt-2 border-t border-bunker-800 space-y-1 text-[11px] font-mono text-zinc-400">
+                    {Object.entries(activeExileModal.voterChoices).map(
+                      ([vUid, tUid]) => (
+                        <div key={vUid}>
+                          • {room.players?.[vUid]?.name || 'Игрок'} → против{' '}
+                          <span className="text-zinc-200">
+                            {room.players?.[tUid]?.name || 'Кандидата'}
+                          </span>
+                        </div>
+                      )
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                sound.playClick();
+                setDismissedExileId(activeExileModal.id);
+              }}
+              className="w-full py-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-bunker-950 font-black text-sm font-mono uppercase tracking-wider transition"
+            >
+              ОК
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Interactive Ability Sheet Modal */}
       {abilityModal && (
         <AbilitySheetModal
           isOpen={abilityModal.isOpen}
@@ -1013,4 +1096,3 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
     </div>
   );
 };
-

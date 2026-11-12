@@ -48,7 +48,7 @@ export interface AttributeCard {
 export type PlayerAttributes = Record<AttributeKey, AttributeCard>;
 
 export interface PlayerVoteModifiers {
-  shielded?: boolean;      // -1 vote against or immunity in current voting
+  shielded?: boolean;      // -1 vote against in current voting
   immune?: boolean;        // Cannot be voted against in current voting
   voteBlocked?: boolean;   // Cannot cast a vote in current voting
   doubleVote?: boolean;    // Vote counts as 2 in current voting
@@ -76,7 +76,9 @@ export interface BunkerSettings {
   catastropheTitle?: string;
   threats?: string;
   roundTimerSeconds: number;
-  packId: string;
+  packIds: string[];
+  packNames?: string[];
+  packId?: string; // legacy compatibility
 }
 
 export type GameStatus =
@@ -87,31 +89,15 @@ export type GameStatus =
   | 'REVOTE'
   | 'FINALE';
 
-export interface CrisisEvent {
-  title: string;
-  description: string;
-  severity: 'low' | 'medium' | 'high' | 'critical';
-}
-
-export interface EpilogueChapter {
-  number: string;
-  title: string;
-  content: string;
-}
-
-export interface AISummaryData {
-  generatedAt: number;
-  source: 'gemini' | 'procedural';
-  modelUsed?: string;
-  survivalProbability: number;
-  verdictTitle: string;
-  verdictSummary: string;
-  roleDistribution: string;
-  crises: CrisisEvent[];
-  outsideFate: string;
-  civilizationOutcome: string;
-  chapters: EpilogueChapter[];
-  rawText?: string;
+export interface ExileResultData {
+  id: string;
+  round: number;
+  exiledUid: string;
+  exiledName: string;
+  maxVotes: number;
+  tally: Record<string, number>;
+  voterChoices: Record<string, string>;
+  timestamp: number;
 }
 
 export interface RoomData {
@@ -130,8 +116,8 @@ export interface RoomData {
   votes?: Record<string, string>;
   tiedCandidates?: string[];
   lastVoteTally?: Record<string, number>;
+  lastExileResult?: ExileResultData | null;
   logs: string[];
-  aiSummary: AISummaryData | null;
 }
 
 export interface PackCardItem {
@@ -147,6 +133,10 @@ export interface CatastrophePreset {
   title: string;
   description: string;
   threats: string;
+  threatLevel?: 'Средняя' | 'Высокая' | 'Критическая' | 'Экстремальная';
+  tags: string[];
+  createdAt: number;
+  isBuiltIn?: boolean;
 }
 
 export interface BunkerPreset {
@@ -155,6 +145,9 @@ export interface BunkerPreset {
   size: number;
   duration: string;
   supplies: string;
+  tags: string[];
+  createdAt: number;
+  isBuiltIn?: boolean;
 }
 
 export interface GamePack {
@@ -162,11 +155,17 @@ export interface GamePack {
   name: string;
   description: string;
   version: string;
+  tags: string[];
+  createdAt: number;
   isBuiltIn?: boolean;
-  catastrophes: CatastrophePreset[];
-  bunkers: BunkerPreset[];
   cards: Record<AttributeKey, PackCardItem[]>;
+  // Optional embedded presets for JSON export/import compatibility
+  catastrophes?: CatastrophePreset[];
+  bunkers?: BunkerPreset[];
 }
+
+export type AdminEntityFilter = 'all' | 'packs' | 'catastrophes' | 'bunkers';
+export type PackSortOption = 'date' | 'alphabet' | 'cardsCount';
 
 export interface FirebaseConfig {
   apiKey: string;
@@ -266,3 +265,10 @@ export const ATTRIBUTE_METADATA: AttributeMeta[] = [
   },
 ];
 
+export function getPackTotalCards(pack: GamePack): number {
+  if (!pack?.cards) return 0;
+  return Object.values(pack.cards).reduce(
+    (sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0),
+    0
+  );
+}

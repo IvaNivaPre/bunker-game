@@ -1,13 +1,25 @@
-import { DEFAULT_PACKS } from '../data/defaultPacks';
-import { FirebaseConfig, GamePack } from '../types/game';
+import {
+  DEFAULT_BUNKERS,
+  DEFAULT_CATASTROPHES,
+  DEFAULT_PACKS,
+} from '../data/defaultPacks';
+import {
+  BunkerPreset,
+  CatastrophePreset,
+  FirebaseConfig,
+  GamePack,
+} from '../types/game';
 
 const KEYS = {
   FIREBASE_CONFIG: 'bunker_firebase_config_v1',
-  GEMINI_API_KEY: 'bunker_gemini_api_key_v1',
-  GEMINI_MODEL: 'bunker_gemini_model_v1',
   ADMIN_PASSWORD_HASH: 'bunker_admin_pwd_v1',
-  CUSTOM_PACKS: 'bunker_custom_packs_v1',
-  ACTIVE_PACK_ID: 'bunker_active_pack_id_v1',
+  CUSTOM_PACKS: 'bunker_custom_packs_v2',
+  DELETED_PACK_IDS: 'bunker_deleted_pack_ids_v2',
+  CUSTOM_CATASTROPHES: 'bunker_custom_catastrophes_v2',
+  DELETED_CATASTROPHE_IDS: 'bunker_deleted_catastrophe_ids_v2',
+  CUSTOM_BUNKERS: 'bunker_custom_bunkers_v2',
+  DELETED_BUNKER_IDS: 'bunker_deleted_bunker_ids_v2',
+  ACTIVE_PACK_IDS: 'bunker_active_pack_ids_v2',
   USER_UID: 'bunker_user_uid_v1',
   USER_NAME: 'bunker_user_name_v1',
   LAST_ROOM: 'bunker_last_room_v1',
@@ -41,7 +53,7 @@ export function saveLastRoomCode(code: string | null): void {
   if (!code) {
     localStorage.removeItem(KEYS.LAST_ROOM);
   } else {
-    localStorage.setItem(KEYS.LAST_ROOM, code.toUpperCase());
+    localStorage.setItem(KEYS.LAST_ROOM, code.trim().toUpperCase());
   }
 }
 
@@ -63,7 +75,6 @@ export function parseFirebaseConfigInput(rawInput: string): FirebaseConfig {
     throw new Error('Поле конфигурации пустое');
   }
 
-  // Try strict JSON first
   try {
     const parsed = JSON.parse(trimmed);
     if (parsed && typeof parsed === 'object' && parsed.apiKey && parsed.projectId) {
@@ -93,7 +104,7 @@ export function parseFirebaseConfigInput(rawInput: string): FirebaseConfig {
     );
   }
 
-  const config: FirebaseConfig = {
+  return {
     apiKey,
     projectId,
     ...(authDomain ? { authDomain } : {}),
@@ -102,8 +113,6 @@ export function parseFirebaseConfigInput(rawInput: string): FirebaseConfig {
     ...(messagingSenderId ? { messagingSenderId } : {}),
     ...(appId ? { appId } : {}),
   };
-
-  return config;
 }
 
 export function getFirebaseConfig(): FirebaseConfig | null {
@@ -124,31 +133,6 @@ export function saveFirebaseConfig(config: FirebaseConfig | null): void {
   }
 }
 
-export function getGeminiApiKey(): string {
-  return localStorage.getItem(KEYS.GEMINI_API_KEY) || '';
-}
-
-export function saveGeminiApiKey(key: string): void {
-  const cleaned = key.trim();
-  if (!cleaned) {
-    localStorage.removeItem(KEYS.GEMINI_API_KEY);
-  } else {
-    localStorage.setItem(KEYS.GEMINI_API_KEY, cleaned);
-  }
-}
-
-export function getGeminiModel(): string {
-  const stored = localStorage.getItem(KEYS.GEMINI_MODEL);
-  if (!stored || stored.startsWith('gemini-1.5')) {
-    return 'gemini-2.5-flash';
-  }
-  return stored;
-}
-
-export function saveGeminiModel(model: string): void {
-  localStorage.setItem(KEYS.GEMINI_MODEL, model);
-}
-
 // Admin password management
 export function hasAdminPassword(): boolean {
   return Boolean(localStorage.getItem(KEYS.ADMIN_PASSWORD_HASH));
@@ -166,7 +150,20 @@ export function verifyAdminPassword(password: string): boolean {
   return stored === encoded;
 }
 
-// Packs management
+function getStringArrayFromStorage(key: string): string[] {
+  const raw = localStorage.getItem(key);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+// ============================================================================
+// 1. ПАКИ ХАРАКТЕРИСТИК (GamePack)
+// ============================================================================
 export function getAllPacks(): GamePack[] {
   const customRaw = localStorage.getItem(KEYS.CUSTOM_PACKS);
   let customPacks: GamePack[] = [];
@@ -177,11 +174,17 @@ export function getAllPacks(): GamePack[] {
       customPacks = [];
     }
   }
-
-  // Merge built-in packs (unless overridden by same id in customPacks)
+  const deletedIds = new Set(getStringArrayFromStorage(KEYS.DELETED_PACK_IDS));
   const customIds = new Set(customPacks.map((p) => p.id));
-  const builtIns = DEFAULT_PACKS.filter((p) => !customIds.has(p.id));
-  return [...builtIns, ...customPacks];
+  const builtIns = DEFAULT_PACKS.filter(
+    (p) => !customIds.has(p.id) && !deletedIds.has(p.id)
+  );
+  const merged = [...builtIns, ...customPacks.filter((p) => !deletedIds.has(p.id))];
+  return merged.map((p) => ({
+    ...p,
+    tags: Array.isArray(p.tags) ? p.tags : ['пользовательский'],
+    createdAt: p.createdAt || Date.now(),
+  }));
 }
 
 export function saveCustomPack(pack: GamePack): GamePack[] {
@@ -195,41 +198,212 @@ export function saveCustomPack(pack: GamePack): GamePack[] {
     }
   }
 
-  const idx = customPacks.findIndex((p) => p.id === pack.id);
+  const normalized: GamePack = {
+    ...pack,
+    tags: Array.isArray(pack.tags) ? pack.tags : ['пользовательский'],
+    createdAt: pack.createdAt || Date.now(),
+  };
+
+  const idx = customPacks.findIndex((p) => p.id === normalized.id);
   if (idx >= 0) {
-    customPacks[idx] = pack;
+    customPacks[idx] = normalized;
   } else {
-    customPacks.push(pack);
+    customPacks.push(normalized);
   }
 
+  // Remove from deletedIds if re-added
+  const deletedIds = getStringArrayFromStorage(KEYS.DELETED_PACK_IDS).filter(
+    (id) => id !== normalized.id
+  );
+  localStorage.setItem(KEYS.DELETED_PACK_IDS, JSON.stringify(deletedIds));
   localStorage.setItem(KEYS.CUSTOM_PACKS, JSON.stringify(customPacks));
   return getAllPacks();
 }
 
-export function deleteCustomPack(packId: string): GamePack[] {
+export function deletePackById(packId: string): GamePack[] {
   const customRaw = localStorage.getItem(KEYS.CUSTOM_PACKS);
-  if (!customRaw) return getAllPacks();
-  try {
-    const customPacks: GamePack[] = JSON.parse(customRaw);
-    const filtered = customPacks.filter((p) => p.id !== packId);
-    localStorage.setItem(KEYS.CUSTOM_PACKS, JSON.stringify(filtered));
-  } catch {
-    // ignore
+  if (customRaw) {
+    try {
+      const customPacks: GamePack[] = JSON.parse(customRaw);
+      const filtered = customPacks.filter((p) => p.id !== packId);
+      localStorage.setItem(KEYS.CUSTOM_PACKS, JSON.stringify(filtered));
+    } catch {
+      // ignore
+    }
   }
+  const deletedIds = new Set(getStringArrayFromStorage(KEYS.DELETED_PACK_IDS));
+  deletedIds.add(packId);
+  localStorage.setItem(KEYS.DELETED_PACK_IDS, JSON.stringify(Array.from(deletedIds)));
   return getAllPacks();
 }
 
-export function getActivePackId(): string {
-  return localStorage.getItem(KEYS.ACTIVE_PACK_ID) || DEFAULT_PACKS[0].id;
+export function getActivePackIds(): string[] {
+  const stored = getStringArrayFromStorage(KEYS.ACTIVE_PACK_IDS);
+  const available = getAllPacks();
+  const availableIds = new Set(available.map((p) => p.id));
+  const valid = stored.filter((id) => availableIds.has(id));
+  if (valid.length > 0) return valid;
+  return available.length > 0 ? [available[0].id] : [DEFAULT_PACKS[0].id];
 }
 
-export function setActivePackId(packId: string): void {
-  localStorage.setItem(KEYS.ACTIVE_PACK_ID, packId);
+export function setActivePackIds(packIds: string[]): void {
+  localStorage.setItem(KEYS.ACTIVE_PACK_IDS, JSON.stringify(packIds));
+}
+
+export function getPacksByIds(packIds?: string[]): GamePack[] {
+  const all = getAllPacks();
+  if (!packIds || packIds.length === 0) {
+    return all.length > 0 ? [all[0]] : [DEFAULT_PACKS[0]];
+  }
+  const idSet = new Set(packIds);
+  const matched = all.filter((p) => idSet.has(p.id));
+  return matched.length > 0 ? matched : all.length > 0 ? [all[0]] : [DEFAULT_PACKS[0]];
 }
 
 export function getPackById(packId?: string): GamePack {
-  const packs = getAllPacks();
-  const targetId = packId || getActivePackId();
-  return packs.find((p) => p.id === targetId) || packs[0] || DEFAULT_PACKS[0];
+  return getPacksByIds(packId ? [packId] : undefined)[0];
 }
 
+// ============================================================================
+// 2. СЦЕНАРИИ КАТАСТРОФ (CatastrophePreset)
+// ============================================================================
+export function getAllCatastrophePresets(): CatastrophePreset[] {
+  const raw = localStorage.getItem(KEYS.CUSTOM_CATASTROPHES);
+  let custom: CatastrophePreset[] = [];
+  if (raw) {
+    try {
+      custom = JSON.parse(raw);
+    } catch {
+      custom = [];
+    }
+  }
+  const deletedIds = new Set(getStringArrayFromStorage(KEYS.DELETED_CATASTROPHE_IDS));
+  const customIds = new Set(custom.map((c) => c.id));
+  const builtIns = DEFAULT_CATASTROPHES.filter(
+    (c) => !customIds.has(c.id) && !deletedIds.has(c.id)
+  );
+  return [...builtIns, ...custom.filter((c) => !deletedIds.has(c.id))];
+}
+
+export function saveCatastrophePreset(preset: CatastrophePreset): CatastrophePreset[] {
+  const raw = localStorage.getItem(KEYS.CUSTOM_CATASTROPHES);
+  let custom: CatastrophePreset[] = [];
+  if (raw) {
+    try {
+      custom = JSON.parse(raw);
+    } catch {
+      custom = [];
+    }
+  }
+  const normalized: CatastrophePreset = {
+    ...preset,
+    tags: Array.isArray(preset.tags) ? preset.tags : ['катастрофа'],
+    createdAt: preset.createdAt || Date.now(),
+  };
+  const idx = custom.findIndex((c) => c.id === normalized.id);
+  if (idx >= 0) {
+    custom[idx] = normalized;
+  } else {
+    custom.push(normalized);
+  }
+  const deletedIds = getStringArrayFromStorage(KEYS.DELETED_CATASTROPHE_IDS).filter(
+    (id) => id !== normalized.id
+  );
+  localStorage.setItem(KEYS.DELETED_CATASTROPHE_IDS, JSON.stringify(deletedIds));
+  localStorage.setItem(KEYS.CUSTOM_CATASTROPHES, JSON.stringify(custom));
+  return getAllCatastrophePresets();
+}
+
+export function deleteCatastrophePreset(id: string): CatastrophePreset[] {
+  const raw = localStorage.getItem(KEYS.CUSTOM_CATASTROPHES);
+  if (raw) {
+    try {
+      const custom: CatastrophePreset[] = JSON.parse(raw);
+      localStorage.setItem(
+        KEYS.CUSTOM_CATASTROPHES,
+        JSON.stringify(custom.filter((c) => c.id !== id))
+      );
+    } catch {
+      // ignore
+    }
+  }
+  const deletedIds = new Set(getStringArrayFromStorage(KEYS.DELETED_CATASTROPHE_IDS));
+  deletedIds.add(id);
+  localStorage.setItem(
+    KEYS.DELETED_CATASTROPHE_IDS,
+    JSON.stringify(Array.from(deletedIds))
+  );
+  return getAllCatastrophePresets();
+}
+
+// ============================================================================
+// 3. ПРЕСЕТЫ БУНКЕРА (BunkerPreset)
+// ============================================================================
+export function getAllBunkerPresets(): BunkerPreset[] {
+  const raw = localStorage.getItem(KEYS.CUSTOM_BUNKERS);
+  let custom: BunkerPreset[] = [];
+  if (raw) {
+    try {
+      custom = JSON.parse(raw);
+    } catch {
+      custom = [];
+    }
+  }
+  const deletedIds = new Set(getStringArrayFromStorage(KEYS.DELETED_BUNKER_IDS));
+  const customIds = new Set(custom.map((b) => b.id));
+  const builtIns = DEFAULT_BUNKERS.filter(
+    (b) => !customIds.has(b.id) && !deletedIds.has(b.id)
+  );
+  return [...builtIns, ...custom.filter((b) => !deletedIds.has(b.id))];
+}
+
+export function saveBunkerPreset(preset: BunkerPreset): BunkerPreset[] {
+  const raw = localStorage.getItem(KEYS.CUSTOM_BUNKERS);
+  let custom: BunkerPreset[] = [];
+  if (raw) {
+    try {
+      custom = JSON.parse(raw);
+    } catch {
+      custom = [];
+    }
+  }
+  const normalized: BunkerPreset = {
+    ...preset,
+    tags: Array.isArray(preset.tags) ? preset.tags : ['бункер'],
+    createdAt: preset.createdAt || Date.now(),
+  };
+  const idx = custom.findIndex((b) => b.id === normalized.id);
+  if (idx >= 0) {
+    custom[idx] = normalized;
+  } else {
+    custom.push(normalized);
+  }
+  const deletedIds = getStringArrayFromStorage(KEYS.DELETED_BUNKER_IDS).filter(
+    (id) => id !== normalized.id
+  );
+  localStorage.setItem(KEYS.DELETED_BUNKER_IDS, JSON.stringify(deletedIds));
+  localStorage.setItem(KEYS.CUSTOM_BUNKERS, JSON.stringify(custom));
+  return getAllBunkerPresets();
+}
+
+export function deleteBunkerPreset(id: string): BunkerPreset[] {
+  const raw = localStorage.getItem(KEYS.CUSTOM_BUNKERS);
+  if (raw) {
+    try {
+      const custom: BunkerPreset[] = JSON.parse(raw);
+      localStorage.setItem(
+        KEYS.CUSTOM_BUNKERS,
+        JSON.stringify(custom.filter((b) => b.id !== id))
+      );
+    } catch {
+      // ignore
+    }
+  }
+  const deletedIds = new Set(getStringArrayFromStorage(KEYS.DELETED_BUNKER_IDS));
+  deletedIds.add(id);
+  localStorage.setItem(
+    KEYS.DELETED_BUNKER_IDS,
+    JSON.stringify(Array.from(deletedIds))
+  );
+  return getAllBunkerPresets();
+}

@@ -7,6 +7,7 @@ import {
 import {
   createRoom,
   joinRoom,
+  normalizeRoomCode,
   removeOrLeavePlayer,
   subscribeToRoom,
 } from './services/firebaseService';
@@ -17,15 +18,49 @@ import { FinaleScreen } from './components/FinaleScreen';
 import { Header } from './components/Header';
 import { AdminModal } from './components/AdminModal';
 
+function checkIsAdminUrl(): boolean {
+  if (typeof window === 'undefined') return false;
+  const path = window.location.pathname.toLowerCase();
+  const hash = window.location.hash.toLowerCase();
+  return path.endsWith('/admin') || hash === '#/admin' || hash === '#admin';
+}
+
 export const App: React.FC = () => {
   const [userUid] = useState<string>(() => getOrCreateUserUid());
   const [activeRoomCode, setActiveRoomCode] = useState<string | null>(null);
   const [roomData, setRoomData] = useState<RoomData | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [isAdminOpen, setIsAdminOpen] = useState<boolean>(false);
+  const [isAdminOpen, setIsAdminOpen] = useState<boolean>(() => checkIsAdminUrl());
   const [, setSettingsTick] = useState<number>(0);
 
-  // Subscribe to real-time updates whenever activeRoomCode is set
+  useEffect(() => {
+    const onHashOrPop = () => {
+      if (checkIsAdminUrl()) {
+        setIsAdminOpen(true);
+      }
+    };
+    window.addEventListener('hashchange', onHashOrPop);
+    window.addEventListener('popstate', onHashOrPop);
+    return () => {
+      window.removeEventListener('hashchange', onHashOrPop);
+      window.removeEventListener('popstate', onHashOrPop);
+    };
+  }, []);
+
+  const openAdminPage = () => {
+    setIsAdminOpen(true);
+    if (typeof window !== 'undefined' && !checkIsAdminUrl()) {
+      window.history.replaceState(null, '', '#/admin');
+    }
+  };
+
+  const closeAdminPage = () => {
+    setIsAdminOpen(false);
+    if (typeof window !== 'undefined' && checkIsAdminUrl()) {
+      window.history.replaceState(null, '', window.location.pathname.replace(/\/admin\/?$/i, '/') || '/');
+    }
+  };
+
   useEffect(() => {
     if (!activeRoomCode) {
       setRoomData(null);
@@ -34,14 +69,14 @@ export const App: React.FC = () => {
 
     const unsubscribe = subscribeToRoom(activeRoomCode, (updatedRoom) => {
       if (!updatedRoom) {
-        setErrorMsg(`Комната #${activeRoomCode} была закрыта или удалена.`);
+        saveLastRoomCode(null);
         setActiveRoomCode(null);
         setRoomData(null);
         return;
       }
-      // If current user was kicked in LOBBY
       if (updatedRoom.status === 'LOBBY' && !updatedRoom.players?.[userUid]) {
         setErrorMsg('Вы покинули комнату или были исключены Хостом.');
+        saveLastRoomCode(null);
         setActiveRoomCode(null);
         setRoomData(null);
         return;
@@ -54,10 +89,10 @@ export const App: React.FC = () => {
     };
   }, [activeRoomCode, userUid]);
 
-  const handleCreateRoom = async (hostName: string, packId: string) => {
+  const handleCreateRoom = async (hostName: string, packIds: string[]) => {
     setErrorMsg(null);
     try {
-      const created = await createRoom(userUid, hostName, packId);
+      const created = await createRoom(userUid, hostName, packIds);
       saveLastRoomCode(created.code);
       setRoomData(created);
       setActiveRoomCode(created.code);
@@ -68,8 +103,9 @@ export const App: React.FC = () => {
 
   const handleJoinRoom = async (code: string, playerName: string) => {
     setErrorMsg(null);
+    const cleaned = normalizeRoomCode(code);
     try {
-      const joined = await joinRoom(code, userUid, playerName);
+      const joined = await joinRoom(cleaned, userUid, playerName);
       saveLastRoomCode(joined.code);
       setRoomData(joined);
       setActiveRoomCode(joined.code);
@@ -91,13 +127,19 @@ export const App: React.FC = () => {
     setRoomData(null);
   };
 
+  const handleFinishAndCleanup = () => {
+    saveLastRoomCode(null);
+    setActiveRoomCode(null);
+    setRoomData(null);
+  };
+
   return (
     <div className="min-h-screen bg-bunker-950 text-zinc-100 flex flex-col">
       {roomData && activeRoomCode ? (
         <>
           <Header
             room={roomData}
-            onOpenAdmin={() => setIsAdminOpen(true)}
+            onOpenAdmin={openAdminPage}
             onLeaveRoom={handleLeaveRoom}
           />
           <main className="flex-1">
@@ -111,7 +153,7 @@ export const App: React.FC = () => {
               <FinaleScreen
                 room={roomData}
                 currentUserUid={userUid}
-                onOpenAdmin={() => setIsAdminOpen(true)}
+                onFinishAndCleanup={handleFinishAndCleanup}
               />
             ) : (
               <GameScreen room={roomData} currentUserUid={userUid} />
@@ -122,7 +164,7 @@ export const App: React.FC = () => {
         <HomeScreen
           onCreateRoom={handleCreateRoom}
           onJoinRoom={handleJoinRoom}
-          onOpenAdmin={() => setIsAdminOpen(true)}
+          onOpenAdmin={openAdminPage}
           errorMsg={errorMsg}
           clearError={() => setErrorMsg(null)}
         />
@@ -130,7 +172,7 @@ export const App: React.FC = () => {
 
       <AdminModal
         isOpen={isAdminOpen}
-        onClose={() => setIsAdminOpen(false)}
+        onClose={closeAdminPage}
         onSettingsChanged={() => setSettingsTick((t) => t + 1)}
       />
     </div>
@@ -138,4 +180,3 @@ export const App: React.FC = () => {
 };
 
 export default App;
-

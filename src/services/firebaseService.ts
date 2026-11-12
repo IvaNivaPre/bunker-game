@@ -4,19 +4,22 @@ import {
   ref,
   set,
   get,
+  remove,
   onValue,
   Database,
 } from 'firebase/database';
 import {
   getFirestore,
   doc,
+  collection,
+  getDocs,
   setDoc,
   getDoc,
+  deleteDoc,
   onSnapshot,
   Firestore,
 } from 'firebase/firestore';
 import {
-  AISummaryData,
   ATTRIBUTE_METADATA,
   AttributeKey,
   BunkerSettings,
@@ -26,15 +29,15 @@ import {
   RoomData,
 } from '../types/game';
 import {
-  drawSingleAttributeCard,
-  generatePlayerAttributes,
+  drawSingleAttributeCardFromPacks,
+  generatePlayerAttributesFromPacks,
 } from '../data/defaultPacks';
 import {
+  getAllBunkerPresets,
+  getAllCatastrophePresets,
   getFirebaseConfig,
-  getPackById,
-  saveCustomPack,
+  getPacksByIds,
 } from './storageService';
-import { generateBunkerFinale } from './geminiService';
 
 export type SyncBackendMode = 'firebase-rtdb' | 'firebase-firestore' | 'local';
 
@@ -44,6 +47,8 @@ let firestoreInstance: Firestore | null = null;
 let currentMode: SyncBackendMode = 'local';
 
 const LOCAL_ROOMS_PREFIX = 'bunker_room_data_';
+const STALE_ROOM_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
 const broadcastChannel =
   typeof window !== 'undefined' && 'BroadcastChannel' in window
     ? new BroadcastChannel('bunker_online_rooms_sync')
@@ -72,6 +77,10 @@ if (typeof window !== 'undefined') {
   });
 }
 
+export function normalizeRoomCode(code: string): string {
+  return (code || '').trim().replace(/\s+/g, '').toUpperCase();
+}
+
 function formatTimeNow(): string {
   const now = new Date();
   const hh = String(now.getHours()).padStart(2, '0');
@@ -87,6 +96,7 @@ export function initFirebaseFromStorage(): {
   const config = getFirebaseConfig();
   if (!config || !config.apiKey || !config.projectId) {
     currentMode = 'local';
+    cleanupStaleRooms().catch(() => {});
     return { mode: 'local' };
   }
 
@@ -108,6 +118,9 @@ export function initFirebaseFromStorage(): {
       currentMode = 'firebase-firestore';
     }
 
+    // Automatically clean up rooms inactive for >24h
+    cleanupStaleRooms().catch(() => {});
+
     return { mode: currentMode, projectId: config.projectId };
   } catch (err) {
     console.error('Firebase initialization failed, falling back to local mode:', err);
@@ -119,7 +132,6 @@ export function initFirebaseFromStorage(): {
   }
 }
 
-// Initialize on module load
 initFirebaseFromStorage();
 
 export function getSyncMode(): SyncBackendMode {
@@ -155,7 +167,7 @@ export async function testFirebaseConnection(
         return {
           ok: true,
           mode: 'firebase-firestore',
-          message: `Cloud Firestore подключен успешно (${config.projectId})! (Для Realtime DB добавьте поле databaseURL)`,
+          message: `Cloud Firestore подключен успешно (${config.projectId})!`,
         };
       }
     }
@@ -181,17 +193,7 @@ function sanitizeForFirebase<T>(obj: T): T {
   return JSON.parse(JSON.stringify(obj));
 }
 
-async function readRoomRaw(code: string): Promise<RoomData | null> {
-  const cleanCode = code.toUpperCase().trim();
-  if (currentMode === 'firebase-rtdb' && rtdbInstance) {
-    const snap = await get(ref(rtdbInstance, `rooms/${cleanCode}`));
-    return snap.exists() ? (snap.val() as RoomData) : null;
-  }
-  if (currentMode === 'firebase-firestore' && firestoreInstance) {
-    const snap = await getDoc(doc(firestoreInstance, 'rooms', cleanCode));
-    return snap.exists() ? (snap.data() as RoomData) : null;
-  }
-  // Local fallback
+function readLocalRoom(cleanCode: string): RoomData | null {
   const raw = localStorage.getItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`);
   if (!raw) return null;
   try {
@@ -201,14 +203,47 @@ async function readRoomRaw(code: string): Promise<RoomData | null> {
   }
 }
 
+/**
+ * Safely reads room data from Firebase (`rooms/${roomCode}`) with graceful 404 / null handling
+ * and local fallback so joining by code never triggers false crashes.
+ */
+async function readRoomRaw(code: string): Promise<RoomData | null> {
+  const cleanCode = normalizeRoomCode(code);
+  if (!cleanCode) return null;
+
+  if (currentMode === 'firebase-rtdb' && rtdbInstance) {
+    try {
+      const snap = await get(ref(rtdbInstance, `rooms/${cleanCode}`));
+      if (snap.exists()) {
+        return snap.val() as RoomData;
+      }
+    } catch (err) {
+      console.warn(`RTDB read for rooms/${cleanCode} failed, checking local fallback:`, err);
+    }
+  }
+
+  if (currentMode === 'firebase-firestore' && firestoreInstance) {
+    try {
+      const snap = await getDoc(doc(firestoreInstance, 'rooms', cleanCode));
+      if (snap.exists()) {
+        return snap.data() as RoomData;
+      }
+    } catch (err) {
+      console.warn(`Firestore read for rooms/${cleanCode} failed, checking local fallback:`, err);
+    }
+  }
+
+  return readLocalRoom(cleanCode);
+}
+
 async function writeRoomRaw(code: string, room: RoomData): Promise<void> {
-  const cleanCode = code.toUpperCase().trim();
+  const cleanCode = normalizeRoomCode(code);
   const payload = sanitizeForFirebase({
     ...room,
+    code: cleanCode,
     updatedAt: Date.now(),
   });
 
-  // Always mirror to local storage as backup
   localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(payload));
   broadcastChannel?.postMessage({ code: cleanCode, room: payload });
   localSubscribers.get(cleanCode)?.forEach((cb) => cb(payload));
@@ -220,21 +255,131 @@ async function writeRoomRaw(code: string, room: RoomData): Promise<void> {
   }
 }
 
+/**
+ * Completely deletes a room from Firebase and localStorage (on game end or Admin termination)
+ */
+export async function deleteRoomCompletely(code: string): Promise<void> {
+  const cleanCode = normalizeRoomCode(code);
+  if (!cleanCode) return;
+
+  localStorage.removeItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`);
+  broadcastChannel?.postMessage({ code: cleanCode, room: null });
+  localSubscribers.get(cleanCode)?.forEach((cb) => cb(null));
+
+  if (currentMode === 'firebase-rtdb' && rtdbInstance) {
+    try {
+      await remove(ref(rtdbInstance, `rooms/${cleanCode}`));
+    } catch (err) {
+      console.warn('Error removing room from RTDB:', err);
+    }
+  } else if (currentMode === 'firebase-firestore' && firestoreInstance) {
+    try {
+      await deleteDoc(doc(firestoreInstance, 'rooms', cleanCode));
+    } catch (err) {
+      console.warn('Error removing room from Firestore:', err);
+    }
+  }
+}
+
+/**
+ * Lists all active rooms across Firebase and localStorage
+ */
+export async function listAllActiveRooms(): Promise<RoomData[]> {
+  const roomsMap = new Map<string, RoomData>();
+
+  // 1. Collect from localStorage
+  if (typeof window !== 'undefined') {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(LOCAL_ROOMS_PREFIX)) {
+        try {
+          const val = JSON.parse(localStorage.getItem(k) || '') as RoomData;
+          if (val && val.code) {
+            roomsMap.set(normalizeRoomCode(val.code), val);
+          }
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+
+  // 2. Collect from Firebase
+  if (currentMode === 'firebase-rtdb' && rtdbInstance) {
+    try {
+      const snap = await get(ref(rtdbInstance, 'rooms'));
+      if (snap.exists()) {
+        const data = snap.val() as Record<string, RoomData>;
+        for (const [code, room] of Object.entries(data)) {
+          if (room && room.code) {
+            roomsMap.set(normalizeRoomCode(code), room);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('Could not list RTDB rooms:', err);
+    }
+  } else if (currentMode === 'firebase-firestore' && firestoreInstance) {
+    try {
+      const snap = await getDocs(collection(firestoreInstance, 'rooms'));
+      snap.forEach((docSnap) => {
+        const room = docSnap.data() as RoomData;
+        if (room && room.code) {
+          roomsMap.set(normalizeRoomCode(room.code), room);
+        }
+      });
+    } catch (err) {
+      console.warn('Could not list Firestore rooms:', err);
+    }
+  }
+
+  return Array.from(roomsMap.values()).sort(
+    (a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0)
+  );
+}
+
+/**
+ * Automatically deletes rooms that have had no updates for more than 24 hours
+ */
+export async function cleanupStaleRooms(
+  maxAgeMs: number = STALE_ROOM_TTL_MS
+): Promise<number> {
+  const allRooms = await listAllActiveRooms();
+  const now = Date.now();
+  let deletedCount = 0;
+
+  for (const room of allRooms) {
+    const lastActive = room.updatedAt || room.createdAt || 0;
+    if (now - lastActive > maxAgeMs) {
+      await deleteRoomCompletely(room.code);
+      deletedCount++;
+    }
+  }
+  return deletedCount;
+}
+
 export function subscribeToRoom(
   code: string,
   onUpdate: (room: RoomData | null) => void
 ): () => void {
-  const cleanCode = code.toUpperCase().trim();
+  const cleanCode = normalizeRoomCode(code);
 
   if (currentMode === 'firebase-rtdb' && rtdbInstance) {
     const roomRef = ref(rtdbInstance, `rooms/${cleanCode}`);
     const unsubscribe = onValue(
       roomRef,
       (snapshot) => {
-        onUpdate(snapshot.exists() ? (snapshot.val() as RoomData) : null);
+        if (snapshot.exists()) {
+          const val = snapshot.val() as RoomData;
+          localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(val));
+          onUpdate(val);
+        } else {
+          onUpdate(null);
+        }
       },
       (error) => {
         console.error('RTDB subscription error:', error);
+        onUpdate(readLocalRoom(cleanCode));
       }
     );
     return () => unsubscribe();
@@ -245,10 +390,17 @@ export function subscribeToRoom(
     const unsubscribe = onSnapshot(
       roomDoc,
       (snapshot) => {
-        onUpdate(snapshot.exists() ? (snapshot.data() as RoomData) : null);
+        if (snapshot.exists()) {
+          const val = snapshot.data() as RoomData;
+          localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(val));
+          onUpdate(val);
+        } else {
+          onUpdate(null);
+        }
       },
       (error) => {
         console.error('Firestore subscription error:', error);
+        onUpdate(readLocalRoom(cleanCode));
       }
     );
     return () => unsubscribe();
@@ -260,7 +412,6 @@ export function subscribeToRoom(
   }
   localSubscribers.get(cleanCode)!.add(onUpdate);
 
-  // Immediately emit current value
   readRoomRaw(cleanCode).then((data) => onUpdate(data));
 
   return () => {
@@ -268,9 +419,6 @@ export function subscribeToRoom(
   };
 }
 
-/**
- * Generates a unique 3-character room code (uppercase Latin letters and digits, excluding ambiguous 0, O, I, 1, L)
- */
 export function generateRoomCode(): string {
   const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
   let result = '';
@@ -280,12 +428,25 @@ export function generateRoomCode(): string {
   return result;
 }
 
+function getRoomSelectedPacks(room: RoomData): GamePack[] {
+  const ids =
+    room.settings?.packIds && room.settings.packIds.length > 0
+      ? room.settings.packIds
+      : room.settings?.packId
+      ? [room.settings.packId]
+      : undefined;
+  return getPacksByIds(ids);
+}
+
 export async function createRoom(
   hostUid: string,
   hostName: string,
-  packId?: string
+  packIds?: string[]
 ): Promise<RoomData> {
-  const pack = getPackById(packId);
+  const selectedPacks = getPacksByIds(packIds);
+  const resolvedPackIds = selectedPacks.map((p) => p.id);
+  const resolvedPackNames = selectedPacks.map((p) => p.name);
+
   let code = generateRoomCode();
   for (let attempt = 0; attempt < 5; attempt++) {
     const existing = await readRoomRaw(code);
@@ -293,13 +454,16 @@ export async function createRoom(
     code = generateRoomCode();
   }
 
-  const presetCatastrophe = pack.catastrophes[0] || {
+  const allCatastrophes = getAllCatastrophePresets();
+  const allBunkers = getAllBunkerPresets();
+
+  const presetCatastrophe = allCatastrophes[0] || {
     title: 'Ядерная зима',
     description: 'Ядерная зима после глобального конфликта. Воздух заражён радиоактивным пеплом.',
     threats: 'Высокий уровень радиации, температура -40°C.',
   };
 
-  const presetBunker = pack.bunkers[0] || {
+  const presetBunker = allBunkers[0] || {
     name: 'Сектор-7',
     size: 100,
     duration: '3 года',
@@ -314,7 +478,7 @@ export async function createRoom(
     joinedAt: Date.now(),
     lastSeen: Date.now(),
     revealedInRound: 0,
-    attributes: generatePlayerAttributes(pack),
+    attributes: generatePlayerAttributesFromPacks(selectedPacks),
   };
 
   const initialRoom: RoomData = {
@@ -328,24 +492,26 @@ export async function createRoom(
     turnOrder: [hostUid],
     timerEndAt: null,
     settings: {
-      capacity: 1, // Will auto-scale as players join: Math.max(1, Math.floor(count / 2))
-      duration: '3 года',
-      size: 100,
+      capacity: 1,
+      duration: presetBunker.duration || '3 года',
+      size: presetBunker.size || 100,
       supplies: presetBunker.supplies,
       catastrophe: `${presetCatastrophe.title}. ${presetCatastrophe.description}`,
       catastropheTitle: presetCatastrophe.title,
       threats: presetCatastrophe.threats,
       roundTimerSeconds: 90,
-      packId: pack.id,
+      packIds: resolvedPackIds,
+      packNames: resolvedPackNames,
+      packId: resolvedPackIds[0],
     },
     players: {
       [hostUid]: hostPlayer,
     },
     votes: {},
+    lastExileResult: null,
     logs: [
-      `${formatTimeNow()}: Хост ${hostPlayer.name} создал бункер #${code}. Ожидание выживших у гермодверей...`,
+      `${formatTimeNow()}: Хост ${hostPlayer.name} создал бункер #${code}. Набор паков: ${resolvedPackNames.join(', ')}.`,
     ],
-    aiSummary: null,
   };
 
   await writeRoomRaw(code, initialRoom);
@@ -357,17 +523,22 @@ export async function joinRoom(
   userUid: string,
   userName: string
 ): Promise<RoomData> {
-  const cleanCode = code.toUpperCase().trim();
+  const cleanCode = normalizeRoomCode(code);
+  if (!cleanCode || cleanCode.length !== 3) {
+    throw new Error('Введите корректный 3-значный код комнаты (например: 7A2).');
+  }
+
   const room = await readRoomRaw(cleanCode);
   if (!room) {
-    throw new Error(`Комната с кодом «${cleanCode}» не найдена.`);
+    throw new Error(
+      `Комната с кодом «${cleanCode}» не найдена (404). Проверьте правильность кода или настройки Firebase.`
+    );
   }
 
   const players = room.players || {};
   const existingPlayer = players[userUid];
 
   if (existingPlayer) {
-    // Reconnect existing player
     existingPlayer.name = userName.trim() || existingPlayer.name;
     existingPlayer.lastSeen = Date.now();
     await writeRoomRaw(cleanCode, room);
@@ -380,7 +551,7 @@ export async function joinRoom(
     );
   }
 
-  const pack = getPackById(room.settings.packId);
+  const selectedPacks = getRoomSelectedPacks(room);
   const newPlayer: PlayerData = {
     uid: userUid,
     name: userName.trim() || `Выживший-${Object.keys(players).length + 1}`,
@@ -389,7 +560,7 @@ export async function joinRoom(
     joinedAt: Date.now(),
     lastSeen: Date.now(),
     revealedInRound: 0,
-    attributes: generatePlayerAttributes(pack),
+    attributes: generatePlayerAttributesFromPacks(selectedPacks),
   };
 
   room.players[userUid] = newPlayer;
@@ -405,14 +576,14 @@ export async function joinRoom(
 }
 
 const BOT_NAMES = [
-  'Виктор (Бот)',
-  'Елена (Бот)',
-  'Кирилл (Бот)',
-  'Мария (Бот)',
-  'Артём (Бот)',
-  'Ольга (Бот)',
-  'Дмитрий (Бот)',
-  'Светлана (Бот)',
+  'Виктор (Авто)',
+  'Елена (Авто)',
+  'Кирилл (Авто)',
+  'Мария (Авто)',
+  'Артём (Авто)',
+  'Ольга (Авто)',
+  'Дмитрий (Авто)',
+  'Светлана (Авто)',
 ];
 
 export async function addBotToRoom(code: string): Promise<void> {
@@ -422,9 +593,9 @@ export async function addBotToRoom(code: string): Promise<void> {
   const existingNames = new Set(Object.values(room.players).map((p) => p.name));
   const botName =
     BOT_NAMES.find((n) => !existingNames.has(n)) ||
-    `Андроид-${Object.keys(room.players).length + 1}`;
+    `Кандидат-${Object.keys(room.players).length + 1}`;
   const botUid = `bot_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-  const pack = getPackById(room.settings.packId);
+  const selectedPacks = getRoomSelectedPacks(room);
 
   room.players[botUid] = {
     uid: botUid,
@@ -435,14 +606,14 @@ export async function addBotToRoom(code: string): Promise<void> {
     joinedAt: Date.now(),
     lastSeen: Date.now(),
     revealedInRound: 0,
-    attributes: generatePlayerAttributes(pack),
+    attributes: generatePlayerAttributesFromPacks(selectedPacks),
   };
 
   const totalPlayers = Object.keys(room.players).length;
   room.settings.capacity = Math.max(1, Math.floor(totalPlayers / 2));
   room.logs = [
     ...(room.logs || []),
-    `${formatTimeNow()}: Добавлен тестовый участник ${botName} (вместимость бункера: ${room.settings.capacity}).`,
+    `${formatTimeNow()}: Добавлен тестовый игрок ${botName} (вместимость бункера: ${room.settings.capacity}).`,
   ];
 
   await writeRoomRaw(code, room);
@@ -454,6 +625,12 @@ export async function updateBunkerSettings(
 ): Promise<void> {
   const room = await readRoomRaw(code);
   if (!room) return;
+
+  if (partialSettings.packIds && partialSettings.packIds.length > 0) {
+    const selectedPacks = getPacksByIds(partialSettings.packIds);
+    partialSettings.packNames = selectedPacks.map((p) => p.name);
+    partialSettings.packId = partialSettings.packIds[0];
+  }
 
   room.settings = {
     ...room.settings,
@@ -467,7 +644,7 @@ export async function startGame(code: string): Promise<void> {
   const room = await readRoomRaw(code);
   if (!room) return;
 
-  const pack = getPackById(room.settings.packId);
+  const selectedPacks = getRoomSelectedPacks(room);
   const usedTracker: Record<AttributeKey, Set<string>> = {
     profession: new Set(),
     gender: new Set(),
@@ -484,20 +661,25 @@ export async function startGame(code: string): Promise<void> {
 
   const playerUids = Object.keys(room.players);
   if (playerUids.length < 2) {
-    throw new Error('Для старта игры нужно минимум 2 участника (вы можете добавить ботов для теста).');
+    throw new Error('Для старта игры нужно минимум 2 участника.');
   }
 
   for (const uid of playerUids) {
     room.players[uid].isAlive = true;
     room.players[uid].revealedInRound = 0;
     room.players[uid].voteModifiers = {};
-    room.players[uid].attributes = generatePlayerAttributes(pack, usedTracker);
+    room.players[uid].attributes = generatePlayerAttributesFromPacks(
+      selectedPacks,
+      usedTracker
+    );
   }
 
-  // Ensure capacity is sensible (at least 1 and less than totalPlayers)
   const cap = Math.max(
     1,
-    Math.min(playerUids.length - 1, Number(room.settings.capacity) || Math.floor(playerUids.length / 2))
+    Math.min(
+      playerUids.length - 1,
+      Number(room.settings.capacity) || Math.floor(playerUids.length / 2)
+    )
   );
   room.settings.capacity = cap;
 
@@ -507,7 +689,7 @@ export async function startGame(code: string): Promise<void> {
   room.currentTurnUid = playerUids[0];
   room.votes = {};
   room.tiedCandidates = [];
-  room.aiSummary = null;
+  room.lastExileResult = null;
   room.timerEndAt =
     room.settings.roundTimerSeconds > 0
       ? Date.now() + room.settings.roundTimerSeconds * 1000
@@ -516,9 +698,7 @@ export async function startGame(code: string): Promise<void> {
   room.logs = [
     ...(room.logs || []),
     `${formatTimeNow()}: === СИРЕНА ТРЕВОГИ! ИГРА НАЧАЛАСЬ (Раунд 1) ===`,
-    `${formatTimeNow()}: Мест в бункере: ${cap} из ${playerUids.length}. Первым открывает характеристику: ${
-      room.players[playerUids[0]]?.name
-    }.`,
+    `${formatTimeNow()}: Активные паки: ${(room.settings.packNames || []).join(', ') || 'Базовый'}. Мест в бункере: ${cap} из ${playerUids.length}.`,
   ];
 
   await writeRoomRaw(code, room);
@@ -550,7 +730,6 @@ export async function revealAttribute(
     `${formatTimeNow()}: ${player.name} открыл характеристику «${meta?.label || label}»: ${card.text}`,
   ];
 
-  // If it was this player's turn, automatically move turn pointer to next alive player who hasn't revealed in this round
   const aliveOrder = (room.turnOrder || Object.keys(room.players)).filter(
     (uid) => room.players[uid]?.isAlive
   );
@@ -595,14 +774,13 @@ export async function activateAbility(
     throw new Error('Эта способность уже была использована.');
   }
 
-  // Mark specialCard itself as revealed when used
   sourceCard.revealed = true;
   sourceCard.ability.used = true;
 
   const ability = sourceCard.ability;
   const targetPlayer =
     (targetPlayerUid && room.players[targetPlayerUid]) || actor;
-  const pack = getPackById(room.settings.packId);
+  const selectedPacks = getRoomSelectedPacks(room);
   let effectLog = '';
 
   switch (ability.effectType) {
@@ -656,7 +834,11 @@ export async function activateAbility(
       const existingTexts = Object.values(room.players).map(
         (p) => p.attributes[attrToReroll]?.text || ''
       );
-      const newCard = drawSingleAttributeCard(pack, attrToReroll, existingTexts);
+      const newCard = drawSingleAttributeCardFromPacks(
+        selectedPacks,
+        attrToReroll,
+        existingTexts
+      );
       targetPlayer.attributes[attrToReroll] = newCard;
       const meta = ATTRIBUTE_METADATA.find((m) => m.key === attrToReroll);
       effectLog = `${actor.name} применил «${ability.name}»: у игрока ${targetPlayer.name} заменена карта «${
@@ -792,7 +974,7 @@ export async function startVoting(code: string): Promise<void> {
   room.votes = {};
   room.tiedCandidates = [];
   room.lastVoteTally = {};
-  room.timerEndAt = Date.now() + 60 * 1000; // 60 sec for voting
+  room.timerEndAt = Date.now() + 60 * 1000;
   room.logs = [
     ...(room.logs || []),
     `${formatTimeNow()}: ⚖️ Запущено тайное голосование за изгнание (Раунд ${room.round}).`,
@@ -875,7 +1057,6 @@ export async function finalizeVoting(
     tally[targetUid] = (tally[targetUid] || 0) + weight;
   }
 
-  // Apply shield modifier (-1 vote against shielded players)
   for (const uid of Object.keys(tally)) {
     if (room.players[uid]?.voteModifiers?.shielded) {
       tally[uid] = Math.max(0, tally[uid] - 1);
@@ -891,7 +1072,6 @@ export async function finalizeVoting(
 
   const leaders = Object.keys(tally).filter((uid) => tally[uid] === maxVotes && maxVotes > 0);
 
-  // No votes cast at all
   if (leaders.length === 0) {
     room.status = 'PLAYING';
     room.round = (room.round || 1) + 1;
@@ -905,11 +1085,10 @@ export async function finalizeVoting(
     return;
   }
 
-  // Tie detected on primary VOTING -> Enter 30-second TIE_DEFENSE speech phase!
   if (leaders.length > 1 && room.status === 'VOTING') {
     room.status = 'TIE_DEFENSE';
     room.tiedCandidates = leaders;
-    room.timerEndAt = Date.now() + 30 * 1000; // 30 seconds defense speech per spec!
+    room.timerEndAt = Date.now() + 30 * 1000;
     const tiedNames = leaders.map((id) => room.players[id]?.name).join(' и ');
     room.logs = [
       ...(room.logs || []),
@@ -919,7 +1098,6 @@ export async function finalizeVoting(
     return;
   }
 
-  // If still tied in REVOTE
   let exiledUid = leaders[0];
   if (leaders.length > 1 && room.status === 'REVOTE') {
     if (tieBreakDecision === 'skip') {
@@ -936,18 +1114,27 @@ export async function finalizeVoting(
       await triggerBotMovesIfNeeded(code);
       return;
     } else {
-      // Random draw among tied leaders
       exiledUid = leaders[Math.floor(Math.random() * leaders.length)];
     }
   }
 
-  // Exile the chosen candidate
   const exiledPlayer = room.players[exiledUid];
+  const currentRound = room.round || 1;
   if (exiledPlayer) {
     exiledPlayer.isAlive = false;
+    room.lastExileResult = {
+      id: `exile_r${currentRound}_${Date.now()}`,
+      round: currentRound,
+      exiledUid,
+      exiledName: exiledPlayer.name,
+      maxVotes,
+      tally: { ...tally },
+      voterChoices: { ...votes },
+      timestamp: Date.now(),
+    };
     room.logs = [
       ...(room.logs || []),
-      `${formatTimeNow()}: 🚪 Игрок ${exiledPlayer.name} изгнан из бункера большинством голосов (${maxVotes} гол.) и переходит в статус «Наблюдатель».`,
+      `${formatTimeNow()}: 🚪 Большинством голосов (${maxVotes} гол.) из бункера был изгнан: ${exiledPlayer.name} (переведён в статус «Наблюдатель»).`,
     ];
   }
 
@@ -956,30 +1143,18 @@ export async function finalizeVoting(
 
   const alivePlayers = Object.values(room.players).filter((p) => p.isAlive);
   if (alivePlayers.length <= room.settings.capacity) {
-    // Transition to FINALE!
     room.status = 'FINALE';
     room.timerEndAt = null;
     room.logs = [
       ...(room.logs || []),
-      `${formatTimeNow()}: 🔒 Число выживших (${alivePlayers.length}) сравнялось с вместимостью бункера (${room.settings.capacity}). ГЕРМОДВЕРИ ЗАПЕЧАТАНЫ! Запуск финального ИИ-анализа...`,
+      `${formatTimeNow()}: 🔒 Число выживших (${alivePlayers.length}) сравнялось с вместимостью бункера (${room.settings.capacity}). БУНКЕР ЗАГЕРМЕТИЗИРОВАН!`,
     ];
     await writeRoomRaw(code, room);
-
-    // Generate AI summary and store in room
-    try {
-      const summary = await generateBunkerFinale(room);
-      const latestRoom = (await readRoomRaw(code)) || room;
-      latestRoom.aiSummary = summary;
-      await writeRoomRaw(code, latestRoom);
-    } catch (err) {
-      console.error('Failed to generate finale summary:', err);
-    }
     return;
   }
 
-  // Otherwise advance to next round of PLAYING
   room.status = 'PLAYING';
-  room.round = (room.round || 1) + 1;
+  room.round = currentRound + 1;
   resetRoundStateForPlayers(room);
   room.logs = [
     ...(room.logs || []),
@@ -1007,22 +1182,17 @@ function resetRoundStateForPlayers(room: RoomData) {
       : null;
 }
 
-export async function regenerateRoomFinale(
-  code: string,
-  customSummary?: AISummaryData
-): Promise<AISummaryData | null> {
+export async function triggerStandardFinale(code: string): Promise<void> {
   const room = await readRoomRaw(code);
-  if (!room) return null;
+  if (!room) return;
 
   room.status = 'FINALE';
-  const summary = customSummary || (await generateBunkerFinale(room));
-  room.aiSummary = summary;
+  room.timerEndAt = null;
   room.logs = [
     ...(room.logs || []),
-    `${formatTimeNow()}: 🤖 Бортовой ИИ сформировал эпилог выживания колонии (${summary.survivalProbability}%).`,
+    `${formatTimeNow()}: 🔒 Гермодвери бункера запечатаны. Подведение итогов выживания.`,
   ];
   await writeRoomRaw(code, room);
-  return summary;
 }
 
 export async function transferHost(code: string, newHostUid: string): Promise<void> {
@@ -1055,11 +1225,11 @@ export async function removeOrLeavePlayer(
     delete room.players[targetUid];
     const remaining = Object.values(room.players);
     if (remaining.length === 0) {
+      await deleteRoomCompletely(code);
       return;
     }
     room.settings.capacity = Math.max(1, Math.floor(remaining.length / 2));
   } else {
-    // During an active game, mark player as exiled/spectator so turn/voting isn't blocked
     room.players[targetUid].isAlive = false;
     room.players[targetUid].isHost = false;
   }
@@ -1111,7 +1281,7 @@ export async function backToLobby(code: string): Promise<void> {
   room.round = 0;
   room.votes = {};
   room.tiedCandidates = [];
-  room.aiSummary = null;
+  room.lastExileResult = null;
   for (const p of Object.values(room.players)) {
     p.isAlive = true;
     p.revealedInRound = 0;
@@ -1124,9 +1294,6 @@ export async function backToLobby(code: string): Promise<void> {
   await writeRoomRaw(code, room);
 }
 
-/**
- * Automates bot actions (revealing 1 card per round and casting votes) so solo/small-group games work smoothly
- */
 async function triggerBotMovesIfNeeded(code: string): Promise<void> {
   const room = await readRoomRaw(code);
   if (!room) return;
@@ -1136,7 +1303,6 @@ async function triggerBotMovesIfNeeded(code: string): Promise<void> {
   if (room.status === 'PLAYING') {
     for (const player of Object.values(room.players)) {
       if (player.isBot && player.isAlive && (player.revealedInRound || 0) < 1) {
-        // In round 1 bots prefer revealing profession first, then random unrevealed
         const unrevealedKeys = ATTRIBUTE_METADATA.map((m) => m.key).filter(
           (k) => k !== 'specialCard' && !player.attributes[k]?.revealed
         );
@@ -1189,53 +1355,17 @@ async function triggerBotMovesIfNeeded(code: string): Promise<void> {
   }
 }
 
-export async function sendPlayerHeartbeat(
-  code: string,
-  userUid: string
+export async function deleteEntityFromFirebase(
+  collectionPath: 'packs' | 'catastrophes' | 'bunkers',
+  id: string
 ): Promise<void> {
-  const room = await readRoomRaw(code);
-  if (!room || !room.players?.[userUid]) return;
-
-  room.players[userUid].lastSeen = Date.now();
-  await writeRoomRaw(code, room);
-}
-
-export async function syncPackToFirebase(pack: GamePack): Promise<void> {
-  try {
-    const payload = sanitizeForFirebase(pack);
-    if (currentMode === 'firebase-rtdb' && rtdbInstance) {
-      await set(ref(rtdbInstance, `packs/${pack.id}`), payload);
-    } else if (currentMode === 'firebase-firestore' && firestoreInstance) {
-      await setDoc(doc(firestoreInstance, 'packs', pack.id), payload);
-    }
-  } catch (err) {
-    console.warn('Could not sync pack to Firebase:', err);
-  }
-}
-
-export async function fetchPackFromFirebaseIfMissing(
-  packId: string
-): Promise<GamePack | null> {
   try {
     if (currentMode === 'firebase-rtdb' && rtdbInstance) {
-      const snap = await get(ref(rtdbInstance, `packs/${packId}`));
-      if (snap.exists()) {
-        const pack = snap.val() as GamePack;
-        saveCustomPack(pack);
-        return pack;
-      }
+      await remove(ref(rtdbInstance, `${collectionPath}/${id}`));
     } else if (currentMode === 'firebase-firestore' && firestoreInstance) {
-      const snap = await getDoc(doc(firestoreInstance, 'packs', packId));
-      if (snap.exists()) {
-        const pack = snap.data() as GamePack;
-        saveCustomPack(pack);
-        return pack;
-      }
+      await deleteDoc(doc(firestoreInstance, collectionPath, id));
     }
   } catch {
     // ignore
   }
-  return null;
 }
-
-

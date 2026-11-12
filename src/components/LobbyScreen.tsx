@@ -4,10 +4,9 @@ import {
   Check,
   Users,
   Crown,
-  Bot,
+  UserPlus,
   Play,
   Sliders,
-  Sparkles,
   LogOut,
   Trash2,
   UserCheck,
@@ -16,6 +15,9 @@ import {
   Maximize2,
   Package,
   Shuffle,
+  Layers,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import { RoomData } from '../types/game';
 import {
@@ -25,7 +27,12 @@ import {
   transferHost,
   updateBunkerSettings,
 } from '../services/firebaseService';
-import { getAllPacks, getPackById } from '../services/storageService';
+import {
+  getAllBunkerPresets,
+  getAllCatastrophePresets,
+  getAllPacks,
+} from '../services/storageService';
+import { PackMultiSelector } from './PackMultiSelector';
 import { sound } from '../services/soundService';
 
 interface LobbyScreenProps {
@@ -44,6 +51,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [selectedCatPresetIdx, setSelectedCatPresetIdx] = useState<number>(0);
   const [selectedBunkPresetIdx, setSelectedBunkPresetIdx] = useState<number>(0);
+  const [showPackSelector, setShowPackSelector] = useState<boolean>(false);
 
   const playersList = Object.values(room.players || {}).sort(
     (a, b) => a.joinedAt - b.joinedAt
@@ -53,7 +61,23 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
     Boolean(room.players[currentUserUid]?.isHost);
 
   const packs = getAllPacks();
-  const activePack = getPackById(room.settings.packId);
+  const catastrophes = getAllCatastrophePresets();
+  const bunkers = getAllBunkerPresets();
+
+  const currentPackIds =
+    room.settings.packIds && room.settings.packIds.length > 0
+      ? room.settings.packIds
+      : room.settings.packId
+      ? [room.settings.packId]
+      : [packs[0]?.id];
+
+  const selectedPacksNames =
+    room.settings.packNames && room.settings.packNames.length > 0
+      ? room.settings.packNames.join(', ')
+      : packs
+          .filter((p) => currentPackIds.includes(p.id))
+          .map((p) => p.name)
+          .join(', ') || 'Классический пак';
 
   const handleCopyCode = () => {
     navigator.clipboard.writeText(room.code);
@@ -62,20 +86,17 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleLoadFromPack = (random = false) => {
+  const handleLoadFromPresets = (random = false) => {
     sound.playReveal();
-    const cats = activePack.catastrophes || [];
-    const bunks = activePack.bunkers || [];
-
     const catIdx = random
-      ? Math.floor(Math.random() * Math.max(1, cats.length))
-      : selectedCatPresetIdx % Math.max(1, cats.length);
+      ? Math.floor(Math.random() * Math.max(1, catastrophes.length))
+      : selectedCatPresetIdx % Math.max(1, catastrophes.length);
     const bunkIdx = random
-      ? Math.floor(Math.random() * Math.max(1, bunks.length))
-      : selectedBunkPresetIdx % Math.max(1, bunks.length);
+      ? Math.floor(Math.random() * Math.max(1, bunkers.length))
+      : selectedBunkPresetIdx % Math.max(1, bunkers.length);
 
-    const chosenCat = cats[catIdx];
-    const chosenBunk = bunks[bunkIdx];
+    const chosenCat = catastrophes[catIdx];
+    const chosenBunk = bunkers[bunkIdx];
 
     setSelectedCatPresetIdx(catIdx);
     setSelectedBunkPresetIdx(bunkIdx);
@@ -117,11 +138,12 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
             ФАЗА 1 // ОЖИДАНИЕ У ГЕРМОДВЕРЕЙ БУНКЕРА
           </div>
           <h2 className="text-xl sm:text-2xl font-extrabold text-zinc-100">
-            Продиктуйте 3-значный код игрокам:
+            Код комнаты для подключения:
           </h2>
           <p className="text-xs text-zinc-400">
             Участников: <strong className="text-zinc-200">{playersList.length}</strong> • Мест в бункере:{' '}
-            <strong className="text-amber-400">{room.settings.capacity}</strong>
+            <strong className="text-amber-400">{room.settings.capacity}</strong> • Набор:{' '}
+            <strong className="text-emerald-300">{selectedPacksNames}</strong>
           </p>
         </div>
 
@@ -176,8 +198,8 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
                   }}
                   className="px-2.5 py-1.5 rounded-lg bg-amber-500/15 border border-amber-500/40 hover:bg-amber-500/25 text-amber-300 text-xs font-mono flex items-center gap-1.5 transition"
                 >
-                  <Bot className="w-3.5 h-3.5" />
-                  + Бот
+                  <UserPlus className="w-3.5 h-3.5" />
+                  + Тест-игрок
                 </button>
               )}
             </div>
@@ -214,7 +236,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
                     )}
                     {player.isBot && (
                       <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300">
-                        ИИ-Бот
+                        Авто
                       </span>
                     )}
                   </div>
@@ -246,13 +268,12 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
             </div>
           </div>
 
-          {/* Start Game Action */}
           <div className="pt-3 border-t border-bunker-800 space-y-2">
             {isHost ? (
               <>
                 {playersList.length < 2 && (
                   <p className="text-xs text-amber-300/90 font-mono text-center">
-                    Подключите второго игрока или нажмите «+ Бот» для тестового запуска
+                    Подключите второго игрока или нажмите «+ Тест-игрок» для запуска
                   </p>
                 )}
                 <button
@@ -275,51 +296,68 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
           </div>
         </div>
 
-        {/* Right Column: Bunker Settings (Editable by Host, Live Preview for Players) */}
+        {/* Right Column: Bunker Settings & Multi-Pack Display */}
         <div className="lg:col-span-7 p-4 sm:p-5 rounded-2xl bg-bunker-900 border border-bunker-700 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-bunker-800 pb-3">
             <h3 className="text-sm font-mono uppercase tracking-wider text-amber-400 flex items-center gap-2">
               <Sliders className="w-4 h-4" />
-              Параметры бункера и катастрофы
+              Настройки комнаты, паков и бункера
             </h3>
 
             {isHost && (
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => handleLoadFromPack(true)}
-                  className="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-bunker-950 font-bold text-xs font-mono flex items-center gap-1.5 shadow transition"
-                >
-                  <Sparkles className="w-3.5 h-3.5" />
-                  Загрузить из пака
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={() => handleLoadFromPresets(true)}
+                className="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-bunker-950 font-bold text-xs font-mono flex items-center gap-1.5 shadow transition"
+              >
+                <Shuffle className="w-3.5 h-3.5" />
+                Загрузить из пресетов
+              </button>
             )}
           </div>
 
-          {/* Pack & Preset Selector for Host */}
-          {isHost && (
-            <div className="p-3.5 rounded-xl bg-bunker-950 border border-bunker-800 space-y-3">
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
-                <div>
-                  <label className="block text-[10px] font-mono uppercase text-zinc-400 mb-1">
-                    Активный пак карт:
-                  </label>
-                  <select
-                    value={room.settings.packId}
-                    onChange={(e) =>
-                      updateBunkerSettings(room.code, { packId: e.target.value })
-                    }
-                    className="w-full bg-bunker-900 border border-bunker-700 rounded-lg px-2.5 py-1.5 text-xs text-zinc-100"
-                  >
-                    {packs.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name}
-                      </option>
-                    ))}
-                  </select>
+          {/* Multi-Pack Summary & Expandable Selector (Section 3) */}
+          <div className="p-3.5 rounded-xl bg-bunker-950 border border-bunker-800 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs min-w-0">
+                <span className="font-mono uppercase text-amber-400 flex items-center gap-1.5">
+                  <Layers className="w-3.5 h-3.5" /> Выбранные паки характеристик:
+                </span>
+                <div className="text-sm font-bold text-zinc-100 mt-0.5">
+                  Набор: {selectedPacksNames}
                 </div>
+              </div>
+              {isHost && (
+                <button
+                  type="button"
+                  onClick={() => setShowPackSelector(!showPackSelector)}
+                  className="px-3 py-1.5 rounded-lg bg-bunker-800 hover:bg-bunker-700 text-xs font-mono text-amber-300 flex items-center gap-1 shrink-0"
+                >
+                  <span>{showPackSelector ? 'Свернуть' : 'Изменить паки'}</span>
+                  {showPackSelector ? (
+                    <ChevronUp className="w-3.5 h-3.5" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5" />
+                  )}
+                </button>
+              )}
+            </div>
 
+            {showPackSelector && isHost && (
+              <div className="pt-2 border-t border-bunker-800">
+                <PackMultiSelector
+                  packs={packs}
+                  selectedPackIds={currentPackIds}
+                  onChange={(nextIds) =>
+                    updateBunkerSettings(room.code, { packIds: nextIds })
+                  }
+                />
+              </div>
+            )}
+
+            {/* Catastrophe & Bunker Preset Dropdowns for Host */}
+            {isHost && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-2 border-t border-bunker-800">
                 <div>
                   <label className="block text-[10px] font-mono uppercase text-zinc-400 mb-1">
                     Пресет катастрофы:
@@ -329,7 +367,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
                     onChange={(e) => {
                       const idx = Number(e.target.value);
                       setSelectedCatPresetIdx(idx);
-                      const c = activePack.catastrophes[idx];
+                      const c = catastrophes[idx];
                       if (c) {
                         updateBunkerSettings(room.code, {
                           catastrophe: `${c.title}. ${c.description} Угрозы: ${c.threats}`,
@@ -340,7 +378,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
                     }}
                     className="w-full bg-bunker-900 border border-bunker-700 rounded-lg px-2.5 py-1.5 text-xs text-zinc-100"
                   >
-                    {(activePack.catastrophes || []).map((c, i) => (
+                    {catastrophes.map((c, i) => (
                       <option key={c.id} value={i}>
                         {c.title}
                       </option>
@@ -357,7 +395,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
                     onChange={(e) => {
                       const idx = Number(e.target.value);
                       setSelectedBunkPresetIdx(idx);
-                      const b = activePack.bunkers[idx];
+                      const b = bunkers[idx];
                       if (b) {
                         updateBunkerSettings(room.code, {
                           size: b.size,
@@ -368,7 +406,7 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
                     }}
                     className="w-full bg-bunker-900 border border-bunker-700 rounded-lg px-2.5 py-1.5 text-xs text-zinc-100"
                   >
-                    {(activePack.bunkers || []).map((b, i) => (
+                    {bunkers.map((b, i) => (
                       <option key={b.id} value={i}>
                         {b.name} ({b.size} м²)
                       </option>
@@ -376,19 +414,10 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
                   </select>
                 </div>
               </div>
-              <div className="flex justify-end">
-                <button
-                  type="button"
-                  onClick={() => handleLoadFromPack(true)}
-                  className="text-xs font-mono text-amber-400 hover:text-amber-300 flex items-center gap-1"
-                >
-                  <Shuffle className="w-3.5 h-3.5" /> Случайная комбинация из пака
-                </button>
-              </div>
-            </div>
-          )}
+            )}
+          </div>
 
-          {/* Numeric / Short Fields: Capacity, Duration, Size, Round Timer */}
+          {/* Numeric / Short Fields */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <div>
               <label className="block text-[11px] font-mono uppercase text-zinc-400 mb-1 flex items-center gap-1">
@@ -466,7 +495,6 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
             </div>
           </div>
 
-          {/* What is in the bunker (supplies) */}
           <div>
             <label className="block text-xs font-mono uppercase text-zinc-400 mb-1.5 flex items-center gap-1.5">
               <Package className="w-3.5 h-3.5 text-emerald-400" />
@@ -483,7 +511,6 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
             />
           </div>
 
-          {/* Catastrophe / General Info */}
           <div>
             <label className="block text-xs font-mono uppercase text-zinc-400 mb-1.5 flex items-center gap-1.5">
               <ShieldAlert className="w-3.5 h-3.5 text-red-400" />
@@ -504,4 +531,3 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
     </div>
   );
 };
-
