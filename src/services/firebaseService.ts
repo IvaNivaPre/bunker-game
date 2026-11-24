@@ -24,7 +24,9 @@ import {
 import {
   ATTRIBUTE_METADATA,
   AttributeKey,
+  BunkerPreset,
   BunkerSettings,
+  CatastrophePreset,
   FirebaseConfig,
   GamePack,
   PlayerData,
@@ -35,11 +37,22 @@ import {
   generatePlayerAttributesFromPacks,
 } from '../data/defaultPacks';
 import {
+  EntityCollectionKind,
+  applyServerBunkerDeletion,
+  applyServerCatastropheDeletion,
+  applyServerPackDeletion,
   getAllBunkerPresets,
   getAllCatastrophePresets,
+  getCustomBunkersOnly,
+  getCustomCatastrophesOnly,
+  getCustomPacksOnly,
+  getDeletedTimestamps,
   getFirebaseConfig,
   getLastRoomCode,
   getPacksByIds,
+  mergeServerBunkerIntoLocal,
+  mergeServerCatastropheIntoLocal,
+  mergeServerPackIntoLocal,
   saveFirebaseConfig,
   saveLastRoomCode,
 } from './storageService';
@@ -50,6 +63,7 @@ let firebaseApp: FirebaseApp | null = null;
 let rtdbInstance: Database | null = null;
 let firestoreInstance: Firestore | null = null;
 let currentMode: SyncBackendMode = 'local';
+let libraryUnsubscribers: (() => void)[] = [];
 
 const LOCAL_ROOMS_PREFIX = 'bunker_room_data_';
 const STALE_ROOM_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -206,6 +220,13 @@ function handleIncomingCloudRoom(code: string, payloadStr: string): void {
       }
     }
 
+    // Merge any custom packs attached to the room snapshot into local library
+    if (Array.isArray(incoming.customPacks)) {
+      for (const p of incoming.customPacks) {
+        mergeServerPackIntoLocal(p);
+      }
+    }
+
     const existing = cloudRoomsCache.get(cleanCode) || readLocalRoom(cleanCode);
     if (existing) {
       // Preserve concurrent votes during active voting phases to prevent vote jumping
@@ -241,6 +262,41 @@ function handleIncomingCloudRoom(code: string, payloadStr: string): void {
   }
 }
 
+function handleIncomingCloudLibrary(subTopic: string, payloadStr: string): void {
+  const parts = subTopic.split('/');
+  // Expected: packs/{id}, catastrophes/{id}, bunkers/{id}, deleted/{kind}/{id}
+  if (parts[0] === 'deleted' && parts.length >= 3) {
+    const kind = parts[1] as EntityCollectionKind;
+    const id = parts.slice(2).join('/');
+    if (!payloadStr || !payloadStr.trim()) return;
+    try {
+      const data = JSON.parse(payloadStr) as { deletedAt?: number };
+      const deletedAt = Number(data?.deletedAt) || Date.now();
+      if (kind === 'packs') applyServerPackDeletion(id, deletedAt);
+      else if (kind === 'catastrophes') applyServerCatastropheDeletion(id, deletedAt);
+      else if (kind === 'bunkers') applyServerBunkerDeletion(id, deletedAt);
+    } catch {
+      // ignore
+    }
+    return;
+  }
+
+  const kind = parts[0] as EntityCollectionKind;
+  if (!payloadStr || !payloadStr.trim()) return;
+  try {
+    const entity = JSON.parse(payloadStr);
+    if (kind === 'packs') {
+      mergeServerPackIntoLocal(entity as GamePack);
+    } else if (kind === 'catastrophes') {
+      mergeServerCatastropheIntoLocal(entity as CatastrophePreset);
+    } else if (kind === 'bunkers') {
+      mergeServerBunkerIntoLocal(entity as BunkerPreset);
+    }
+  } catch {
+    // ignore malformed payload
+  }
+}
+
 function processMqttBuffer(): void {
   while (mqttRxBuffer.length >= 2) {
     const byte0 = mqttRxBuffer[0];
@@ -271,8 +327,9 @@ function processMqttBuffer(): void {
     if (packetType === 2) {
       // CONNACK
       mqttConnected = true;
-      // Subscribe to all rooms on the relay
+      // Subscribe to all rooms & server library (packs/catastrophes/bunkers) on the relay
       sendMqttRaw(buildMqttSubscribePacket(`${CLOUD_TOPIC_PREFIX}/rooms/+`));
+      sendMqttRaw(buildMqttSubscribePacket(`${CLOUD_TOPIC_PREFIX}/library/#`));
       while (mqttPendingQueue.length > 0) {
         const nextPkt = mqttPendingQueue.shift();
         if (nextPkt) sendMqttRaw(nextPkt);
@@ -290,10 +347,14 @@ function processMqttBuffer(): void {
           ? new TextDecoder().decode(body.slice(payloadOffset))
           : '';
 
-      const prefix = `${CLOUD_TOPIC_PREFIX}/rooms/`;
-      if (topic.startsWith(prefix)) {
-        const roomCode = topic.slice(prefix.length);
+      const roomPrefix = `${CLOUD_TOPIC_PREFIX}/rooms/`;
+      const libPrefix = `${CLOUD_TOPIC_PREFIX}/library/`;
+      if (topic.startsWith(roomPrefix)) {
+        const roomCode = topic.slice(roomPrefix.length);
         handleIncomingCloudRoom(roomCode, payloadStr);
+      } else if (topic.startsWith(libPrefix)) {
+        const subTopic = topic.slice(libPrefix.length);
+        handleIncomingCloudLibrary(subTopic, payloadStr);
       }
     }
   }
@@ -480,6 +541,7 @@ export function initFirebaseFromStorage(): {
   if (!config || !config.apiKey || !config.projectId) {
     currentMode = 'local';
     cleanupStaleRooms().catch(() => {});
+    startServerLibrarySubscriptions();
     return { mode: 'local' };
   }
 
@@ -520,8 +582,10 @@ export function initFirebaseFromStorage(): {
       currentMode = 'local';
     }
 
-    // Automatically clean up rooms inactive for >24h
+    // Automatically clean up rooms inactive for >24h & start realtime server library sync
     cleanupStaleRooms().catch(() => {});
+    startServerLibrarySubscriptions();
+    syncLibraryWithServer().catch(() => {});
 
     return { mode: currentMode, projectId: config.projectId };
   } catch (err) {
@@ -689,6 +753,11 @@ async function readRoomRaw(code: string): Promise<RoomData | null> {
       null
     );
     if (rtdbRoom && rtdbRoom.code) {
+      if (Array.isArray(rtdbRoom.customPacks)) {
+        for (const p of rtdbRoom.customPacks) {
+          mergeServerPackIntoLocal(p);
+        }
+      }
       cloudRoomsCache.set(cleanCode, rtdbRoom);
       localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(rtdbRoom));
       return rtdbRoom;
@@ -705,6 +774,11 @@ async function readRoomRaw(code: string): Promise<RoomData | null> {
       null
     );
     if (fsRoom && fsRoom.code) {
+      if (Array.isArray(fsRoom.customPacks)) {
+        for (const p of fsRoom.customPacks) {
+          mergeServerPackIntoLocal(p);
+        }
+      }
       cloudRoomsCache.set(cleanCode, fsRoom);
       localStorage.setItem(`${LOCAL_ROOMS_PREFIX}${cleanCode}`, JSON.stringify(fsRoom));
       return fsRoom;
@@ -996,7 +1070,36 @@ function getRoomSelectedPacks(room: RoomData): GamePack[] {
       : room.settings?.packId
       ? [room.settings.packId]
       : undefined;
-  return getPacksByIds(ids);
+
+  const basePacks = getPacksByIds(ids);
+  if (!room.customPacks || room.customPacks.length === 0) {
+    return basePacks;
+  }
+
+  const embeddedById = new Map(room.customPacks.map((p) => [p.id, p]));
+  if (!ids || ids.length === 0) {
+    return basePacks;
+  }
+
+  const resolved: GamePack[] = [];
+  for (const id of ids) {
+    const embedded = embeddedById.get(id);
+    const local = basePacks.find((p) => p.id === id);
+    if (embedded && (!local || (embedded.updatedAt || 0) >= (local.updatedAt || 0))) {
+      resolved.push(embedded);
+    } else if (local) {
+      resolved.push(local);
+    }
+  }
+  return resolved.length > 0 ? resolved : basePacks;
+}
+
+function getEmbeddedCustomPacksForIds(packIds: string[]): GamePack[] {
+  const customOnly = getCustomPacksOnly();
+  const customMap = new Map(customOnly.map((p) => [p.id, p]));
+  return packIds
+    .map((id) => customMap.get(id))
+    .filter((p): p is GamePack => Boolean(p));
 }
 
 export async function createRoom(
@@ -1070,6 +1173,7 @@ export async function createRoom(
     },
     votes: {},
     lastExileResult: null,
+    customPacks: getEmbeddedCustomPacksForIds(resolvedPackIds),
     logs: [
       `${formatTimeNow()}: Хост ${hostPlayer.name} создал бункер #${code}. Набор паков: ${resolvedPackNames.join(', ')}.`,
     ],
@@ -1200,6 +1304,7 @@ export async function updateBunkerSettings(
     const selectedPacks = getPacksByIds(partialSettings.packIds);
     partialSettings.packNames = selectedPacks.map((p) => p.name);
     partialSettings.packId = partialSettings.packIds[0];
+    room.customPacks = getEmbeddedCustomPacksForIds(partialSettings.packIds);
   }
 
   room.settings = {
@@ -2056,19 +2161,423 @@ async function triggerBotMovesIfNeeded(code: string): Promise<void> {
   }
 }
 
+// ============================================================================
+// SERVER-SIDE LIBRARY STORAGE & CROSS-DEVICE REALTIME SYNC
+// (Packs, Catastrophe Presets, Bunker Presets)
+// ============================================================================
+
+function stopServerLibrarySubscriptions(): void {
+  for (const unsub of libraryUnsubscribers) {
+    try {
+      unsub();
+    } catch {
+      // ignore
+    }
+  }
+  libraryUnsubscribers = [];
+}
+
+function applyRemoteEntity(kind: EntityCollectionKind, entity: unknown): void {
+  if (!entity || typeof entity !== 'object') return;
+  if (kind === 'packs') {
+    mergeServerPackIntoLocal(entity as GamePack);
+  } else if (kind === 'catastrophes') {
+    mergeServerCatastropheIntoLocal(entity as CatastrophePreset);
+  } else if (kind === 'bunkers') {
+    mergeServerBunkerIntoLocal(entity as BunkerPreset);
+  }
+}
+
+function applyRemoteDeletion(
+  kind: EntityCollectionKind,
+  id: string,
+  deletedAt: number
+): void {
+  if (!id) return;
+  if (kind === 'packs') {
+    applyServerPackDeletion(id, deletedAt);
+  } else if (kind === 'catastrophes') {
+    applyServerCatastropheDeletion(id, deletedAt);
+  } else if (kind === 'bunkers') {
+    applyServerBunkerDeletion(id, deletedAt);
+  }
+}
+
+export async function saveEntityToServer(
+  collectionPath: EntityCollectionKind,
+  entity: GamePack | CatastrophePreset | BunkerPreset
+): Promise<void> {
+  if (!entity || !entity.id) return;
+  const payload = sanitizeForFirebase({
+    ...entity,
+    updatedAt: entity.updatedAt || Date.now(),
+  });
+
+  // 1. Always push to Cloud Relay (retained message) for instant cross-device sync
+  connectCloudRelay();
+  sendMqttRaw(
+    buildMqttPublishPacket(
+      `${CLOUD_TOPIC_PREFIX}/library/${collectionPath}/${entity.id}`,
+      JSON.stringify(payload),
+      true
+    )
+  );
+  // Clear any old retained deletion tombstone on the relay
+  sendMqttRaw(
+    buildMqttPublishPacket(
+      `${CLOUD_TOPIC_PREFIX}/library/deleted/${collectionPath}/${entity.id}`,
+      null,
+      true
+    )
+  );
+
+  // 2. Push to Firebase (RTDB or Firestore) if configured
+  const delDocId = `${collectionPath}_${entity.id}`;
+  const ops: Promise<unknown>[] = [];
+
+  if (rtdbInstance && currentMode === 'firebase-rtdb') {
+    ops.push(
+      withTimeout(
+        set(ref(rtdbInstance, `${collectionPath}/${entity.id}`), payload),
+        3500,
+        undefined
+      )
+    );
+    ops.push(
+      withTimeout(
+        remove(ref(rtdbInstance, `deleted_entities/${delDocId}`)),
+        2500,
+        undefined
+      )
+    );
+  }
+
+  if (firestoreInstance && currentMode === 'firebase-firestore') {
+    ops.push(
+      withTimeout(
+        setDoc(doc(firestoreInstance, collectionPath, entity.id), payload),
+        3500,
+        undefined
+      )
+    );
+    ops.push(
+      withTimeout(
+        deleteDoc(doc(firestoreInstance, 'deleted_entities', delDocId)),
+        2500,
+        undefined
+      )
+    );
+  }
+
+  if (ops.length > 0) {
+    await Promise.all(ops);
+  }
+}
+
+export async function savePackToServer(pack: GamePack): Promise<void> {
+  await saveEntityToServer('packs', pack);
+}
+
+export async function saveCatastropheToServer(
+  cat: CatastrophePreset
+): Promise<void> {
+  await saveEntityToServer('catastrophes', cat);
+}
+
+export async function saveBunkerToServer(bunk: BunkerPreset): Promise<void> {
+  await saveEntityToServer('bunkers', bunk);
+}
+
 export async function deleteEntityFromFirebase(
   collectionPath: 'packs' | 'catastrophes' | 'bunkers',
   id: string
 ): Promise<void> {
+  const deletedAt = Date.now();
+  const delDocId = `${collectionPath}_${id}`;
+
+  // 1. Clear retained item & publish retained deletion tombstone on Cloud Relay
+  connectCloudRelay();
+  sendMqttRaw(
+    buildMqttPublishPacket(
+      `${CLOUD_TOPIC_PREFIX}/library/${collectionPath}/${id}`,
+      null,
+      true
+    )
+  );
+  sendMqttRaw(
+    buildMqttPublishPacket(
+      `${CLOUD_TOPIC_PREFIX}/library/deleted/${collectionPath}/${id}`,
+      JSON.stringify({ kind: collectionPath, id, deletedAt }),
+      true
+    )
+  );
+
+  // 2. Remove from Firebase & write deletion tombstone so other devices also remove it
   try {
-    if (currentMode === 'firebase-rtdb' && rtdbInstance) {
-      await remove(ref(rtdbInstance, `${collectionPath}/${id}`));
-    } else if (currentMode === 'firebase-firestore' && firestoreInstance) {
-      await deleteDoc(doc(firestoreInstance, collectionPath, id));
+    const ops: Promise<unknown>[] = [];
+    if (rtdbInstance && currentMode === 'firebase-rtdb') {
+      ops.push(
+        withTimeout(remove(ref(rtdbInstance, `${collectionPath}/${id}`)), 3000, undefined)
+      );
+      ops.push(
+        withTimeout(
+          set(ref(rtdbInstance, `deleted_entities/${delDocId}`), {
+            kind: collectionPath,
+            id,
+            deletedAt,
+          }),
+          3000,
+          undefined
+        )
+      );
+    }
+    if (firestoreInstance && currentMode === 'firebase-firestore') {
+      ops.push(
+        withTimeout(
+          deleteDoc(doc(firestoreInstance, collectionPath, id)),
+          3000,
+          undefined
+        )
+      );
+      ops.push(
+        withTimeout(
+          setDoc(doc(firestoreInstance, 'deleted_entities', delDocId), {
+            kind: collectionPath,
+            id,
+            deletedAt,
+          }),
+          3000,
+          undefined
+        )
+      );
+    }
+    if (ops.length > 0) {
+      await Promise.all(ops);
     }
   } catch {
     // ignore
   }
+}
+
+export function startServerLibrarySubscriptions(): void {
+  stopServerLibrarySubscriptions();
+  connectCloudRelay();
+  sendMqttRaw(buildMqttSubscribePacket(`${CLOUD_TOPIC_PREFIX}/library/#`));
+
+  const kinds: EntityCollectionKind[] = ['packs', 'catastrophes', 'bunkers'];
+
+  if (currentMode === 'firebase-rtdb' && rtdbInstance) {
+    for (const kind of kinds) {
+      const colRef = ref(rtdbInstance, kind);
+      const unsub = onValue(
+        colRef,
+        (snap) => {
+          if (!snap.exists()) return;
+          const val = snap.val() as Record<string, unknown>;
+          for (const item of Object.values(val || {})) {
+            applyRemoteEntity(kind, item);
+          }
+        },
+        (err) => {
+          console.warn(`RTDB subscription for ${kind} failed:`, err);
+        }
+      );
+      libraryUnsubscribers.push(unsub);
+    }
+
+    const delRef = ref(rtdbInstance, 'deleted_entities');
+    const delUnsub = onValue(
+      delRef,
+      (snap) => {
+        if (!snap.exists()) return;
+        const val = snap.val() as Record<
+          string,
+          { kind?: EntityCollectionKind; id?: string; deletedAt?: number }
+        >;
+        for (const item of Object.values(val || {})) {
+          if (item?.kind && item?.id) {
+            applyRemoteDeletion(item.kind, item.id, Number(item.deletedAt) || Date.now());
+          }
+        }
+      },
+      () => {}
+    );
+    libraryUnsubscribers.push(delUnsub);
+  } else if (currentMode === 'firebase-firestore' && firestoreInstance) {
+    for (const kind of kinds) {
+      const colRef = collection(firestoreInstance, kind);
+      const unsub = onSnapshot(
+        colRef,
+        (snap) => {
+          snap.forEach((docSnap) => {
+            applyRemoteEntity(kind, docSnap.data());
+          });
+        },
+        (err) => {
+          console.warn(`Firestore subscription for ${kind} failed:`, err);
+        }
+      );
+      libraryUnsubscribers.push(unsub);
+    }
+
+    const delCol = collection(firestoreInstance, 'deleted_entities');
+    const delUnsub = onSnapshot(
+      delCol,
+      (snap) => {
+        snap.forEach((docSnap) => {
+          const item = docSnap.data() as {
+            kind?: EntityCollectionKind;
+            id?: string;
+            deletedAt?: number;
+          };
+          if (item?.kind && item?.id) {
+            applyRemoteDeletion(item.kind, item.id, Number(item.deletedAt) || Date.now());
+          }
+        });
+      },
+      () => {}
+    );
+    libraryUnsubscribers.push(delUnsub);
+  }
+}
+
+/**
+ * Bidirectional sync of Packs, Catastrophes, and Bunkers between local storage
+ * and Firebase / Cloud Relay servers.
+ */
+export async function syncLibraryWithServer(): Promise<{
+  pulled: number;
+  pushed: number;
+}> {
+  let pulled = 0;
+  let pushed = 0;
+
+  connectCloudRelay();
+  sendMqttRaw(buildMqttSubscribePacket(`${CLOUD_TOPIC_PREFIX}/library/#`));
+
+  const kinds: EntityCollectionKind[] = ['packs', 'catastrophes', 'bunkers'];
+
+  // 1. Pull remote deletions first so stale local entries aren't re-uploaded
+  if (currentMode === 'firebase-rtdb' && rtdbInstance) {
+    const delSnap = await withTimeout(
+      get(ref(rtdbInstance, 'deleted_entities')),
+      3000,
+      null
+    );
+    if (delSnap && delSnap.exists()) {
+      const data = delSnap.val() as Record<
+        string,
+        { kind?: EntityCollectionKind; id?: string; deletedAt?: number }
+      >;
+      for (const item of Object.values(data || {})) {
+        if (item?.kind && item?.id) {
+          applyRemoteDeletion(item.kind, item.id, Number(item.deletedAt) || Date.now());
+        }
+      }
+    }
+
+    for (const kind of kinds) {
+      const snap = await withTimeout(get(ref(rtdbInstance, kind)), 3000, null);
+      if (snap && snap.exists()) {
+        const data = snap.val() as Record<string, unknown>;
+        for (const item of Object.values(data || {})) {
+          if (kind === 'packs' && mergeServerPackIntoLocal(item as GamePack)) {
+            pulled++;
+          } else if (
+            kind === 'catastrophes' &&
+            mergeServerCatastropheIntoLocal(item as CatastrophePreset)
+          ) {
+            pulled++;
+          } else if (
+            kind === 'bunkers' &&
+            mergeServerBunkerIntoLocal(item as BunkerPreset)
+          ) {
+            pulled++;
+          }
+        }
+      }
+    }
+  } else if (currentMode === 'firebase-firestore' && firestoreInstance) {
+    const delSnap = await withTimeout(
+      getDocs(collection(firestoreInstance, 'deleted_entities')),
+      3000,
+      null
+    );
+    if (delSnap) {
+      delSnap.forEach((docSnap) => {
+        const item = docSnap.data() as {
+          kind?: EntityCollectionKind;
+          id?: string;
+          deletedAt?: number;
+        };
+        if (item?.kind && item?.id) {
+          applyRemoteDeletion(item.kind, item.id, Number(item.deletedAt) || Date.now());
+        }
+      });
+    }
+
+    for (const kind of kinds) {
+      const snap = await withTimeout(
+        getDocs(collection(firestoreInstance, kind)),
+        3000,
+        null
+      );
+      if (snap) {
+        snap.forEach((docSnap) => {
+          const item = docSnap.data();
+          if (kind === 'packs' && mergeServerPackIntoLocal(item as GamePack)) {
+            pulled++;
+          } else if (
+            kind === 'catastrophes' &&
+            mergeServerCatastropheIntoLocal(item as CatastrophePreset)
+          ) {
+            pulled++;
+          } else if (
+            kind === 'bunkers' &&
+            mergeServerBunkerIntoLocal(item as BunkerPreset)
+          ) {
+            pulled++;
+          }
+        });
+      }
+    }
+  }
+
+  // 2. Push local custom/modified packs, catastrophes, and bunkers to the server
+  const localPacks = getCustomPacksOnly();
+  const localCats = getCustomCatastrophesOnly();
+  const localBunks = getCustomBunkersOnly();
+  const delTimestamps = getDeletedTimestamps();
+
+  for (const p of localPacks) {
+    await saveEntityToServer('packs', p);
+    pushed++;
+  }
+  for (const c of localCats) {
+    await saveEntityToServer('catastrophes', c);
+    pushed++;
+  }
+  for (const b of localBunks) {
+    await saveEntityToServer('bunkers', b);
+    pushed++;
+  }
+
+  // Also ensure any local deletions are reflected on the server
+  for (const [compositeKey, ts] of Object.entries(delTimestamps)) {
+    const idx = compositeKey.indexOf(':');
+    if (idx <= 0) continue;
+    const kind = compositeKey.slice(0, idx) as EntityCollectionKind;
+    const id = compositeKey.slice(idx + 1);
+    sendMqttRaw(
+      buildMqttPublishPacket(
+        `${CLOUD_TOPIC_PREFIX}/library/deleted/${kind}/${id}`,
+        JSON.stringify({ kind, id, deletedAt: ts }),
+        true
+      )
+    );
+  }
+
+  return { pulled, pushed };
 }
 
 // ============================================================================

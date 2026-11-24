@@ -24,7 +24,60 @@ const KEYS = {
   USER_NAME: 'bunker_user_name_v1',
   LAST_ROOM: 'bunker_last_room_v1',
   SOUND_ENABLED: 'bunker_sound_enabled_v1',
+  DELETED_TIMESTAMPS: 'bunker_deleted_timestamps_v1',
 };
+
+const libraryBroadcastChannel =
+  typeof window !== 'undefined' && 'BroadcastChannel' in window
+    ? new BroadcastChannel('bunker_online_library_sync')
+    : null;
+
+export function notifyLibraryUpdated(broadcast = true): void {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('bunker-library-updated'));
+  }
+  if (broadcast && libraryBroadcastChannel) {
+    try {
+      libraryBroadcastChannel.postMessage({ updatedAt: Date.now() });
+    } catch {
+      // ignore
+    }
+  }
+}
+
+if (libraryBroadcastChannel) {
+  libraryBroadcastChannel.onmessage = () => {
+    notifyLibraryUpdated(false);
+  };
+}
+
+export type EntityCollectionKind = 'packs' | 'catastrophes' | 'bunkers';
+
+export function getDeletedTimestamps(): Record<string, number> {
+  const raw = localStorage.getItem(KEYS.DELETED_TIMESTAMPS);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function setDeletedTimestamp(
+  kind: EntityCollectionKind,
+  id: string,
+  timestamp: number | null
+): void {
+  const map = getDeletedTimestamps();
+  const compositeKey = `${kind}:${id}`;
+  if (timestamp === null) {
+    delete map[compositeKey];
+  } else {
+    map[compositeKey] = Math.max(map[compositeKey] || 0, timestamp);
+  }
+  localStorage.setItem(KEYS.DELETED_TIMESTAMPS, JSON.stringify(map));
+}
 
 export function getOrCreateUserUid(): string {
   let uid = localStorage.getItem(KEYS.USER_UID);
@@ -164,17 +217,24 @@ function getStringArrayFromStorage(key: string): string[] {
 // ============================================================================
 // 1. ПАКИ ХАРАКТЕРИСТИК (GamePack)
 // ============================================================================
-export function getAllPacks(): GamePack[] {
+export function getCustomPacksOnly(): GamePack[] {
   const customRaw = localStorage.getItem(KEYS.CUSTOM_PACKS);
-  let customPacks: GamePack[] = [];
-  if (customRaw) {
-    try {
-      customPacks = JSON.parse(customRaw);
-    } catch {
-      customPacks = [];
-    }
+  if (!customRaw) return [];
+  try {
+    const parsed = JSON.parse(customRaw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
   }
-  const deletedIds = new Set(getStringArrayFromStorage(KEYS.DELETED_PACK_IDS));
+}
+
+export function getDeletedPackIds(): string[] {
+  return getStringArrayFromStorage(KEYS.DELETED_PACK_IDS);
+}
+
+export function getAllPacks(): GamePack[] {
+  const customPacks = getCustomPacksOnly();
+  const deletedIds = new Set(getDeletedPackIds());
   const customIds = new Set(customPacks.map((p) => p.id));
   const builtIns = DEFAULT_PACKS.filter(
     (p) => !customIds.has(p.id) && !deletedIds.has(p.id)
@@ -184,24 +244,19 @@ export function getAllPacks(): GamePack[] {
     ...p,
     tags: Array.isArray(p.tags) ? p.tags : ['пользовательский'],
     createdAt: p.createdAt || Date.now(),
+    updatedAt: p.updatedAt || p.createdAt || 0,
   }));
 }
 
-export function saveCustomPack(pack: GamePack): GamePack[] {
-  const customRaw = localStorage.getItem(KEYS.CUSTOM_PACKS);
-  let customPacks: GamePack[] = [];
-  if (customRaw) {
-    try {
-      customPacks = JSON.parse(customRaw);
-    } catch {
-      customPacks = [];
-    }
-  }
+export function saveCustomPack(pack: GamePack, silent = false): GamePack[] {
+  const customPacks = getCustomPacksOnly();
 
+  const now = Date.now();
   const normalized: GamePack = {
     ...pack,
     tags: Array.isArray(pack.tags) ? pack.tags : ['пользовательский'],
-    createdAt: pack.createdAt || Date.now(),
+    createdAt: pack.createdAt || now,
+    updatedAt: pack.updatedAt || now,
   };
 
   const idx = customPacks.findIndex((p) => p.id === normalized.id);
@@ -216,25 +271,69 @@ export function saveCustomPack(pack: GamePack): GamePack[] {
     (id) => id !== normalized.id
   );
   localStorage.setItem(KEYS.DELETED_PACK_IDS, JSON.stringify(deletedIds));
+  setDeletedTimestamp('packs', normalized.id, null);
   localStorage.setItem(KEYS.CUSTOM_PACKS, JSON.stringify(customPacks));
+  if (!silent) notifyLibraryUpdated();
   return getAllPacks();
 }
 
-export function deletePackById(packId: string): GamePack[] {
-  const customRaw = localStorage.getItem(KEYS.CUSTOM_PACKS);
-  if (customRaw) {
-    try {
-      const customPacks: GamePack[] = JSON.parse(customRaw);
-      const filtered = customPacks.filter((p) => p.id !== packId);
-      localStorage.setItem(KEYS.CUSTOM_PACKS, JSON.stringify(filtered));
-    } catch {
-      // ignore
-    }
-  }
+export function deletePackById(
+  packId: string,
+  deletedAt: number = Date.now(),
+  silent = false
+): GamePack[] {
+  const customPacks = getCustomPacksOnly();
+  const filtered = customPacks.filter((p) => p.id !== packId);
+  localStorage.setItem(KEYS.CUSTOM_PACKS, JSON.stringify(filtered));
+
   const deletedIds = new Set(getStringArrayFromStorage(KEYS.DELETED_PACK_IDS));
   deletedIds.add(packId);
   localStorage.setItem(KEYS.DELETED_PACK_IDS, JSON.stringify(Array.from(deletedIds)));
+  setDeletedTimestamp('packs', packId, deletedAt);
+  if (!silent) notifyLibraryUpdated();
   return getAllPacks();
+}
+
+export function mergeServerPackIntoLocal(pack: GamePack): boolean {
+  if (!pack || !pack.id || !pack.cards) return false;
+  const deletedTs = getDeletedTimestamps()[`packs:${pack.id}`] || 0;
+  const incomingTs = pack.updatedAt || pack.createdAt || 0;
+  if (deletedTs > incomingTs) return false;
+
+  const customPacks = getCustomPacksOnly();
+  const existing = customPacks.find((p) => p.id === pack.id);
+  const existingTs = existing ? existing.updatedAt || existing.createdAt || 0 : 0;
+  if (existing && existingTs >= incomingTs) return false;
+
+  saveCustomPack(
+    {
+      ...pack,
+      tags: Array.isArray(pack.tags) ? pack.tags : ['пользовательский'],
+      createdAt: pack.createdAt || incomingTs || Date.now(),
+      updatedAt: incomingTs || Date.now(),
+    },
+    true
+  );
+  notifyLibraryUpdated(false);
+  return true;
+}
+
+export function applyServerPackDeletion(
+  packId: string,
+  deletedAt: number
+): boolean {
+  if (!packId) return false;
+  const existing = getCustomPacksOnly().find((p) => p.id === packId);
+  const existingTs = existing ? existing.updatedAt || existing.createdAt || 0 : 0;
+  if (existing && existingTs > deletedAt) return false;
+
+  const alreadyDeleted = getDeletedPackIds().includes(packId);
+  const prevDelTs = getDeletedTimestamps()[`packs:${packId}`] || 0;
+  if (alreadyDeleted && prevDelTs >= deletedAt) return false;
+
+  deletePackById(packId, deletedAt, true);
+  notifyLibraryUpdated(false);
+  return true;
 }
 
 export function getActivePackIds(): string[] {
@@ -267,16 +366,19 @@ export function getPackById(packId?: string): GamePack {
 // ============================================================================
 // 2. СЦЕНАРИИ КАТАСТРОФ (CatastrophePreset)
 // ============================================================================
-export function getAllCatastrophePresets(): CatastrophePreset[] {
+export function getCustomCatastrophesOnly(): CatastrophePreset[] {
   const raw = localStorage.getItem(KEYS.CUSTOM_CATASTROPHES);
-  let custom: CatastrophePreset[] = [];
-  if (raw) {
-    try {
-      custom = JSON.parse(raw);
-    } catch {
-      custom = [];
-    }
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
   }
+}
+
+export function getAllCatastrophePresets(): CatastrophePreset[] {
+  const custom = getCustomCatastrophesOnly();
   const deletedIds = new Set(getStringArrayFromStorage(KEYS.DELETED_CATASTROPHE_IDS));
   const customIds = new Set(custom.map((c) => c.id));
   const builtIns = DEFAULT_CATASTROPHES.filter(
@@ -285,20 +387,17 @@ export function getAllCatastrophePresets(): CatastrophePreset[] {
   return [...builtIns, ...custom.filter((c) => !deletedIds.has(c.id))];
 }
 
-export function saveCatastrophePreset(preset: CatastrophePreset): CatastrophePreset[] {
-  const raw = localStorage.getItem(KEYS.CUSTOM_CATASTROPHES);
-  let custom: CatastrophePreset[] = [];
-  if (raw) {
-    try {
-      custom = JSON.parse(raw);
-    } catch {
-      custom = [];
-    }
-  }
+export function saveCatastrophePreset(
+  preset: CatastrophePreset,
+  silent = false
+): CatastrophePreset[] {
+  const custom = getCustomCatastrophesOnly();
+  const now = Date.now();
   const normalized: CatastrophePreset = {
     ...preset,
     tags: Array.isArray(preset.tags) ? preset.tags : ['катастрофа'],
-    createdAt: preset.createdAt || Date.now(),
+    createdAt: preset.createdAt || now,
+    updatedAt: preset.updatedAt || now,
   };
   const idx = custom.findIndex((c) => c.id === normalized.id);
   if (idx >= 0) {
@@ -310,45 +409,93 @@ export function saveCatastrophePreset(preset: CatastrophePreset): CatastrophePre
     (id) => id !== normalized.id
   );
   localStorage.setItem(KEYS.DELETED_CATASTROPHE_IDS, JSON.stringify(deletedIds));
+  setDeletedTimestamp('catastrophes', normalized.id, null);
   localStorage.setItem(KEYS.CUSTOM_CATASTROPHES, JSON.stringify(custom));
+  if (!silent) notifyLibraryUpdated();
   return getAllCatastrophePresets();
 }
 
-export function deleteCatastrophePreset(id: string): CatastrophePreset[] {
-  const raw = localStorage.getItem(KEYS.CUSTOM_CATASTROPHES);
-  if (raw) {
-    try {
-      const custom: CatastrophePreset[] = JSON.parse(raw);
-      localStorage.setItem(
-        KEYS.CUSTOM_CATASTROPHES,
-        JSON.stringify(custom.filter((c) => c.id !== id))
-      );
-    } catch {
-      // ignore
-    }
-  }
+export function deleteCatastrophePreset(
+  id: string,
+  deletedAt: number = Date.now(),
+  silent = false
+): CatastrophePreset[] {
+  const custom = getCustomCatastrophesOnly();
+  localStorage.setItem(
+    KEYS.CUSTOM_CATASTROPHES,
+    JSON.stringify(custom.filter((c) => c.id !== id))
+  );
   const deletedIds = new Set(getStringArrayFromStorage(KEYS.DELETED_CATASTROPHE_IDS));
   deletedIds.add(id);
   localStorage.setItem(
     KEYS.DELETED_CATASTROPHE_IDS,
     JSON.stringify(Array.from(deletedIds))
   );
+  setDeletedTimestamp('catastrophes', id, deletedAt);
+  if (!silent) notifyLibraryUpdated();
   return getAllCatastrophePresets();
+}
+
+export function mergeServerCatastropheIntoLocal(
+  preset: CatastrophePreset
+): boolean {
+  if (!preset || !preset.id) return false;
+  const deletedTs = getDeletedTimestamps()[`catastrophes:${preset.id}`] || 0;
+  const incomingTs = preset.updatedAt || preset.createdAt || 0;
+  if (deletedTs > incomingTs) return false;
+
+  const custom = getCustomCatastrophesOnly();
+  const existing = custom.find((c) => c.id === preset.id);
+  const existingTs = existing ? existing.updatedAt || existing.createdAt || 0 : 0;
+  if (existing && existingTs >= incomingTs) return false;
+
+  saveCatastrophePreset(
+    {
+      ...preset,
+      tags: Array.isArray(preset.tags) ? preset.tags : ['катастрофа'],
+      createdAt: preset.createdAt || incomingTs || Date.now(),
+      updatedAt: incomingTs || Date.now(),
+    },
+    true
+  );
+  notifyLibraryUpdated(false);
+  return true;
+}
+
+export function applyServerCatastropheDeletion(
+  id: string,
+  deletedAt: number
+): boolean {
+  if (!id) return false;
+  const existing = getCustomCatastrophesOnly().find((c) => c.id === id);
+  const existingTs = existing ? existing.updatedAt || existing.createdAt || 0 : 0;
+  if (existing && existingTs > deletedAt) return false;
+
+  const deletedIds = getStringArrayFromStorage(KEYS.DELETED_CATASTROPHE_IDS);
+  const prevDelTs = getDeletedTimestamps()[`catastrophes:${id}`] || 0;
+  if (deletedIds.includes(id) && prevDelTs >= deletedAt) return false;
+
+  deleteCatastrophePreset(id, deletedAt, true);
+  notifyLibraryUpdated(false);
+  return true;
 }
 
 // ============================================================================
 // 3. ПРЕСЕТЫ БУНКЕРА (BunkerPreset)
 // ============================================================================
-export function getAllBunkerPresets(): BunkerPreset[] {
+export function getCustomBunkersOnly(): BunkerPreset[] {
   const raw = localStorage.getItem(KEYS.CUSTOM_BUNKERS);
-  let custom: BunkerPreset[] = [];
-  if (raw) {
-    try {
-      custom = JSON.parse(raw);
-    } catch {
-      custom = [];
-    }
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
   }
+}
+
+export function getAllBunkerPresets(): BunkerPreset[] {
+  const custom = getCustomBunkersOnly();
   const deletedIds = new Set(getStringArrayFromStorage(KEYS.DELETED_BUNKER_IDS));
   const customIds = new Set(custom.map((b) => b.id));
   const builtIns = DEFAULT_BUNKERS.filter(
@@ -357,20 +504,17 @@ export function getAllBunkerPresets(): BunkerPreset[] {
   return [...builtIns, ...custom.filter((b) => !deletedIds.has(b.id))];
 }
 
-export function saveBunkerPreset(preset: BunkerPreset): BunkerPreset[] {
-  const raw = localStorage.getItem(KEYS.CUSTOM_BUNKERS);
-  let custom: BunkerPreset[] = [];
-  if (raw) {
-    try {
-      custom = JSON.parse(raw);
-    } catch {
-      custom = [];
-    }
-  }
+export function saveBunkerPreset(
+  preset: BunkerPreset,
+  silent = false
+): BunkerPreset[] {
+  const custom = getCustomBunkersOnly();
+  const now = Date.now();
   const normalized: BunkerPreset = {
     ...preset,
     tags: Array.isArray(preset.tags) ? preset.tags : ['бункер'],
-    createdAt: preset.createdAt || Date.now(),
+    createdAt: preset.createdAt || now,
+    updatedAt: preset.updatedAt || now,
   };
   const idx = custom.findIndex((b) => b.id === normalized.id);
   if (idx >= 0) {
@@ -382,28 +526,71 @@ export function saveBunkerPreset(preset: BunkerPreset): BunkerPreset[] {
     (id) => id !== normalized.id
   );
   localStorage.setItem(KEYS.DELETED_BUNKER_IDS, JSON.stringify(deletedIds));
+  setDeletedTimestamp('bunkers', normalized.id, null);
   localStorage.setItem(KEYS.CUSTOM_BUNKERS, JSON.stringify(custom));
+  if (!silent) notifyLibraryUpdated();
   return getAllBunkerPresets();
 }
 
-export function deleteBunkerPreset(id: string): BunkerPreset[] {
-  const raw = localStorage.getItem(KEYS.CUSTOM_BUNKERS);
-  if (raw) {
-    try {
-      const custom: BunkerPreset[] = JSON.parse(raw);
-      localStorage.setItem(
-        KEYS.CUSTOM_BUNKERS,
-        JSON.stringify(custom.filter((b) => b.id !== id))
-      );
-    } catch {
-      // ignore
-    }
-  }
+export function deleteBunkerPreset(
+  id: string,
+  deletedAt: number = Date.now(),
+  silent = false
+): BunkerPreset[] {
+  const custom = getCustomBunkersOnly();
+  localStorage.setItem(
+    KEYS.CUSTOM_BUNKERS,
+    JSON.stringify(custom.filter((b) => b.id !== id))
+  );
   const deletedIds = new Set(getStringArrayFromStorage(KEYS.DELETED_BUNKER_IDS));
   deletedIds.add(id);
   localStorage.setItem(
     KEYS.DELETED_BUNKER_IDS,
     JSON.stringify(Array.from(deletedIds))
   );
+  setDeletedTimestamp('bunkers', id, deletedAt);
+  if (!silent) notifyLibraryUpdated();
   return getAllBunkerPresets();
+}
+
+export function mergeServerBunkerIntoLocal(preset: BunkerPreset): boolean {
+  if (!preset || !preset.id) return false;
+  const deletedTs = getDeletedTimestamps()[`bunkers:${preset.id}`] || 0;
+  const incomingTs = preset.updatedAt || preset.createdAt || 0;
+  if (deletedTs > incomingTs) return false;
+
+  const custom = getCustomBunkersOnly();
+  const existing = custom.find((b) => b.id === preset.id);
+  const existingTs = existing ? existing.updatedAt || existing.createdAt || 0 : 0;
+  if (existing && existingTs >= incomingTs) return false;
+
+  saveBunkerPreset(
+    {
+      ...preset,
+      tags: Array.isArray(preset.tags) ? preset.tags : ['бункер'],
+      createdAt: preset.createdAt || incomingTs || Date.now(),
+      updatedAt: incomingTs || Date.now(),
+    },
+    true
+  );
+  notifyLibraryUpdated(false);
+  return true;
+}
+
+export function applyServerBunkerDeletion(
+  id: string,
+  deletedAt: number
+): boolean {
+  if (!id) return false;
+  const existing = getCustomBunkersOnly().find((b) => b.id === id);
+  const existingTs = existing ? existing.updatedAt || existing.createdAt || 0 : 0;
+  if (existing && existingTs > deletedAt) return false;
+
+  const deletedIds = getStringArrayFromStorage(KEYS.DELETED_BUNKER_IDS);
+  const prevDelTs = getDeletedTimestamps()[`bunkers:${id}`] || 0;
+  if (deletedIds.includes(id) && prevDelTs >= deletedAt) return false;
+
+  deleteBunkerPreset(id, deletedAt, true);
+  notifyLibraryUpdated(false);
+  return true;
 }

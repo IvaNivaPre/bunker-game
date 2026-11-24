@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Copy,
   Check,
@@ -52,6 +52,17 @@ export const LobbyScreen: React.FC<LobbyScreenProps> = ({
   const [selectedCatPresetIdx, setSelectedCatPresetIdx] = useState<number>(0);
   const [selectedBunkPresetIdx, setSelectedBunkPresetIdx] = useState<number>(0);
   const [showPackSelector, setShowPackSelector] = useState<boolean>(false);
+  const [, setLibraryTick] = useState<number>(0);
+
+  useEffect(() => {
+    const onLibUpdated = () => setLibraryTick((t) => t + 1);
+    window.addEventListener('bunker-library-updated', onLibUpdated);
+    window.addEventListener('storage', onLibUpdated);
+    return () => {
+      window.removeEventListener('bunker-library-updated', onLibUpdated);
+      window.removeEventListener('storage', onLibUpdated);
+    };
+  }, []);
 
   const playersList = Object.values(room.players || {}).sort(
     (a, b) => a.joinedAt - b.joinedAt

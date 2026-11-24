@@ -118,6 +118,7 @@ export interface RoomData {
   lastVoteTally?: Record<string, number>;
   lastExileResult?: ExileResultData | null;
   firebaseConfig?: FirebaseConfig;
+  customPacks?: GamePack[];
   logs: string[];
 }
 
@@ -137,6 +138,7 @@ export interface CatastrophePreset {
   threatLevel?: 'Средняя' | 'Высокая' | 'Критическая' | 'Экстремальная';
   tags: string[];
   createdAt: number;
+  updatedAt?: number;
   isBuiltIn?: boolean;
 }
 
@@ -148,6 +150,7 @@ export interface BunkerPreset {
   supplies: string;
   tags: string[];
   createdAt: number;
+  updatedAt?: number;
   isBuiltIn?: boolean;
 }
 
@@ -158,6 +161,7 @@ export interface GamePack {
   version: string;
   tags: string[];
   createdAt: number;
+  updatedAt?: number;
   isBuiltIn?: boolean;
   cards: Record<AttributeKey, PackCardItem[]>;
   // Optional embedded presets for JSON export/import compatibility

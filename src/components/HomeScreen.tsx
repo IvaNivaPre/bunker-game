@@ -53,9 +53,23 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const [loading, setLoading] = useState<boolean>(false);
   const [showRules, setShowRules] = useState<boolean>(false);
   const [lastRoom, setLastRoom] = useState<string | null>(() => getLastRoomCode());
+  const [, setLibraryTick] = useState<number>(0);
 
   const packs = getAllPacks();
   const syncMode = getSyncMode();
+
+  useEffect(() => {
+    const onLibUpdated = () => {
+      setLibraryTick((t) => t + 1);
+      setSelectedPackIds(getActivePackIds());
+    };
+    window.addEventListener('bunker-library-updated', onLibUpdated);
+    window.addEventListener('storage', onLibUpdated);
+    return () => {
+      window.removeEventListener('bunker-library-updated', onLibUpdated);
+      window.removeEventListener('storage', onLibUpdated);
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;

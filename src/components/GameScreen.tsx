@@ -728,7 +728,9 @@ export const GameScreen: React.FC<GameScreenProps> = ({ room, currentUserUid }) 
                         </span>
                       )}
                       {player.isHost && (
-                        <Crown className="w-4 h-4 text-amber-400" title="Хост" />
+                        <span title="Хост" className="inline-flex">
+                          <Crown className="w-4 h-4 text-amber-400" />
+                        </span>
                       )}
                       {isCurrentTurn && player.isAlive && (
                         <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500 text-bunker-950 font-bold">

@@ -63,6 +63,10 @@ import {
   getSyncMode,
   initFirebaseFromStorage,
   listAllActiveRooms,
+  saveBunkerToServer,
+  saveCatastropheToServer,
+  savePackToServer,
+  syncLibraryWithServer,
   testFirebaseConnection,
 } from '../services/firebaseService';
 
@@ -145,6 +149,8 @@ export const AdminModal: React.FC<AdminModalProps> = ({
   // Active Rooms management state (Section 2.4)
   const [activeRooms, setActiveRooms] = useState<RoomData[]>([]);
   const [loadingRooms, setLoadingRooms] = useState<boolean>(false);
+  const [syncingLibrary, setSyncingLibrary] = useState<boolean>(false);
+  const pendingEntityTimersRef = useRef<Map<string, number>>(new Map());
 
   // Firebase state
   const existingFbConfig = getFirebaseConfig();
@@ -171,7 +177,58 @@ export const AdminModal: React.FC<AdminModalProps> = ({
     }
   };
 
+  const refreshLocalLibraryLists = () => {
+    setPacks(getAllPacks());
+    setCatastrophes(getAllCatastrophePresets());
+    setBunkers(getAllBunkerPresets());
+  };
+
+  const handleManualLibrarySync = async (silent = false) => {
+    setSyncingLibrary(true);
+    try {
+      const res = await syncLibraryWithServer();
+      refreshLocalLibraryLists();
+      onSettingsChanged();
+      if (!silent) {
+        setNoticeMsg(
+          `Синхронизация с сервером завершена (получено: ${res.pulled}, отправлено: ${res.pushed}).`
+        );
+      }
+    } finally {
+      setSyncingLibrary(false);
+    }
+  };
+
+  const scheduleServerEntityPush = (
+    key: string,
+    pushFn: () => Promise<void>,
+    delayMs = 400
+  ) => {
+    const prevTimer = pendingEntityTimersRef.current.get(key);
+    if (prevTimer) window.clearTimeout(prevTimer);
+    const timer = window.setTimeout(() => {
+      pendingEntityTimersRef.current.delete(key);
+      pushFn().catch(() => {});
+    }, delayMs);
+    pendingEntityTimersRef.current.set(key, timer);
+  };
+
   useEffect(() => {
+    const onLibUpdated = () => {
+      refreshLocalLibraryLists();
+    };
+    window.addEventListener('bunker-library-updated', onLibUpdated);
+    window.addEventListener('storage', onLibUpdated);
+    return () => {
+      window.removeEventListener('bunker-library-updated', onLibUpdated);
+      window.removeEventListener('storage', onLibUpdated);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (isOpen && isAuthenticated && activeTab === 'entities') {
+      handleManualLibrarySync(true);
+    }
     if (isOpen && isAuthenticated && activeTab === 'rooms') {
       refreshActiveRooms();
     }
@@ -322,13 +379,15 @@ export const AdminModal: React.FC<AdminModalProps> = ({
 
   // Create new Characteristic Pack
   const handleCreateNewPack = () => {
+    const now = Date.now();
     const newPack: GamePack = {
-      id: `pack_${Date.now()}`,
+      id: `pack_${now}`,
       name: 'Новый пак характеристик',
       description: 'Авторский набор карт для 11 характеристик выживших.',
       version: '1.0.0',
       tags: ['авторский', 'выживание'],
-      createdAt: Date.now(),
+      createdAt: now,
+      updatedAt: now,
       isBuiltIn: false,
       cards: {
         profession: [],
@@ -348,20 +407,24 @@ export const AdminModal: React.FC<AdminModalProps> = ({
     setPacks(next);
     setEditingPackId(newPack.id);
     onSettingsChanged();
-    setNoticeMsg('Создан новый пак характеристик! Откройте категории для добавления карт.');
+    savePackToServer(newPack).catch(() => {});
+    setNoticeMsg('Создан новый пак характеристик и сохранён на сервере!');
   };
 
   const handleClonePack = (pack: GamePack) => {
+    const now = Date.now();
     const cloned: GamePack = JSON.parse(JSON.stringify(pack));
-    cloned.id = `pack_${Date.now()}`;
+    cloned.id = `pack_${now}`;
     cloned.name = `${pack.name} (Копия)`;
-    cloned.createdAt = Date.now();
+    cloned.createdAt = now;
+    cloned.updatedAt = now;
     cloned.isBuiltIn = false;
     const next = saveCustomPack(cloned);
     setPacks(next);
     setEditingPackId(cloned.id);
     onSettingsChanged();
-    setNoticeMsg(`Создана копия пака: «${cloned.name}»`);
+    savePackToServer(cloned).catch(() => {});
+    setNoticeMsg(`Создана копия пака «${cloned.name}» и отправлена на сервер.`);
   };
 
   const handleExportPack = (pack: GamePack) => {
@@ -382,19 +445,22 @@ export const AdminModal: React.FC<AdminModalProps> = ({
     const reader = new FileReader();
     reader.onload = (event) => {
       try {
+        const now = Date.now();
         const parsed = JSON.parse(String(event.target?.result)) as GamePack;
         if (!parsed.name || !parsed.cards) {
           throw new Error('Некорректный формат JSON пака');
         }
-        parsed.id = parsed.id || `imported_${Date.now()}`;
-        parsed.createdAt = Date.now();
+        parsed.id = parsed.id || `imported_${now}`;
+        parsed.createdAt = now;
+        parsed.updatedAt = now;
         parsed.tags = Array.isArray(parsed.tags) ? parsed.tags : ['импорт'];
         parsed.isBuiltIn = false;
         const nextPacks = saveCustomPack(parsed);
         setPacks(nextPacks);
         setEditingPackId(parsed.id);
         onSettingsChanged();
-        setNoticeMsg(`Пак «${parsed.name}» успешно импортирован!`);
+        savePackToServer(parsed).catch(() => {});
+        setNoticeMsg(`Пак «${parsed.name}» импортирован и синхронизирован с сервером!`);
       } catch (err) {
         alert(
           'Ошибка импорта JSON: ' + (err instanceof Error ? err.message : String(err))
@@ -409,9 +475,13 @@ export const AdminModal: React.FC<AdminModalProps> = ({
     if (!editingPack) return;
     const clone: GamePack = JSON.parse(JSON.stringify(editingPack));
     const updated = updater(clone);
+    updated.updatedAt = Date.now();
     const next = saveCustomPack(updated);
     setPacks(next);
     onSettingsChanged();
+    scheduleServerEntityPush(`pack_${updated.id}`, () =>
+      savePackToServer(updated)
+    );
   };
 
   const handleAddCardToCategory = (e: React.FormEvent) => {
@@ -464,41 +534,47 @@ export const AdminModal: React.FC<AdminModalProps> = ({
 
   // Create new isolated Catastrophe Scenario
   const handleCreateCatastrophe = () => {
+    const now = Date.now();
     const newCat: CatastrophePreset = {
-      id: `cat_${Date.now()}`,
+      id: `cat_${now}`,
       title: 'Новый сценарий катастрофы',
       description: 'Подробное описание глобального катаклизма и условий на поверхности...',
       threats: 'Высокий уровень радиации, токсичная атмосфера, мороз -35°C',
       threatLevel: 'Критическая',
       tags: ['катастрофа', 'авторский'],
-      createdAt: Date.now(),
+      createdAt: now,
+      updatedAt: now,
       isBuiltIn: false,
     };
     const next = saveCatastrophePreset(newCat);
     setCatastrophes(next);
     setEntityFilter('catastrophes');
     onSettingsChanged();
-    setNoticeMsg('Добавлен новый сценарий катастрофы.');
+    saveCatastropheToServer(newCat).catch(() => {});
+    setNoticeMsg('Добавлен новый сценарий катастрофы (синхронизирован с сервером).');
   };
 
   // Create new isolated Bunker Preset
   const handleCreateBunker = () => {
+    const now = Date.now();
     const newBunk: BunkerPreset = {
-      id: `bunk_${Date.now()}`,
+      id: `bunk_${now}`,
       name: 'Новый пресет бункера',
       size: 120,
       duration: '3 года',
       supplies:
         'Автономный генератор, система фильтрации воздуха и воды, запас консервов на 2.5 года, медотсек',
       tags: ['бункер', 'авторский'],
-      createdAt: Date.now(),
+      createdAt: now,
+      updatedAt: now,
       isBuiltIn: false,
     };
     const next = saveBunkerPreset(newBunk);
     setBunkers(next);
     setEntityFilter('bunkers');
     onSettingsChanged();
-    setNoticeMsg('Добавлен новый пресет бункера.');
+    saveBunkerToServer(newBunk).catch(() => {});
+    setNoticeMsg('Добавлен новый пресет бункера (синхронизирован с сервером).');
   };
 
   const handleSaveAndTestFirebase = async () => {
@@ -512,6 +588,8 @@ export const AdminModal: React.FC<AdminModalProps> = ({
       setFbText(JSON.stringify(parsed, null, 2));
       const testRes = await testFirebaseConnection(parsed);
       initFirebaseFromStorage();
+      await syncLibraryWithServer().catch(() => {});
+      refreshLocalLibraryLists();
       onSettingsChanged();
       setFbStatus({
         type: testRes.ok ? 'success' : 'error',
@@ -727,7 +805,19 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                       </button>
                     </div>
 
-                    <div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={syncingLibrary}
+                        onClick={() => handleManualLibrarySync(false)}
+                        className="px-3.5 py-2 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-300 text-xs font-mono flex items-center gap-1.5 transition"
+                        title="Синхронизировать паки, катастрофы и бункеры с сервером"
+                      >
+                        <RefreshCw
+                          className={`w-4 h-4 ${syncingLibrary ? 'animate-spin' : ''}`}
+                        />
+                        {syncingLibrary ? 'Синхронизация...' : 'Синхр. с сервером'}
+                      </button>
                       <button
                         type="button"
                         onClick={() => fileInputRef.current?.click()}
@@ -1181,23 +1271,31 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                                 type="text"
                                 value={cat.title}
                                 onChange={(e) => {
-                                  const next = saveCatastrophePreset({
+                                  const updatedCat: CatastrophePreset = {
                                     ...cat,
                                     title: e.target.value,
-                                  });
+                                    updatedAt: Date.now(),
+                                  };
+                                  const next = saveCatastrophePreset(updatedCat);
                                   setCatastrophes(next);
                                   onSettingsChanged();
+                                  scheduleServerEntityPush(`cat_${cat.id}`, () =>
+                                    saveCatastropheToServer(updatedCat)
+                                  );
                                 }}
                                 className="flex-1 bg-bunker-900 border border-bunker-700 rounded-lg px-3 py-1.5 text-xs font-bold text-red-300"
                               />
                               <select
                                 value={cat.threatLevel || 'Критическая'}
                                 onChange={(e) => {
-                                  const next = saveCatastrophePreset({
+                                  const updatedCat: CatastrophePreset = {
                                     ...cat,
                                     threatLevel: e.target.value as CatastrophePreset['threatLevel'],
-                                  });
+                                    updatedAt: Date.now(),
+                                  };
+                                  const next = saveCatastrophePreset(updatedCat);
                                   setCatastrophes(next);
+                                  saveCatastropheToServer(updatedCat).catch(() => {});
                                 }}
                                 className="bg-bunker-900 border border-bunker-700 rounded-lg px-2 py-1.5 text-[11px] font-mono text-amber-300"
                               >
@@ -1226,12 +1324,17 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                               rows={2}
                               value={cat.description}
                               onChange={(e) => {
-                                const next = saveCatastrophePreset({
+                                const updatedCat: CatastrophePreset = {
                                   ...cat,
                                   description: e.target.value,
-                                });
+                                  updatedAt: Date.now(),
+                                };
+                                const next = saveCatastrophePreset(updatedCat);
                                 setCatastrophes(next);
                                 onSettingsChanged();
+                                scheduleServerEntityPush(`cat_${cat.id}`, () =>
+                                  saveCatastropheToServer(updatedCat)
+                                );
                               }}
                               className="w-full bg-bunker-900 border border-bunker-700 rounded-lg px-3 py-1.5 text-xs text-zinc-200"
                               placeholder="Полное описание катастрофы..."
@@ -1241,12 +1344,17 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                               type="text"
                               value={cat.threats}
                               onChange={(e) => {
-                                const next = saveCatastrophePreset({
+                                const updatedCat: CatastrophePreset = {
                                   ...cat,
                                   threats: e.target.value,
-                                });
+                                  updatedAt: Date.now(),
+                                };
+                                const next = saveCatastrophePreset(updatedCat);
                                 setCatastrophes(next);
                                 onSettingsChanged();
+                                scheduleServerEntityPush(`cat_${cat.id}`, () =>
+                                  saveCatastropheToServer(updatedCat)
+                                );
                               }}
                               className="w-full bg-bunker-900 border border-bunker-700 rounded-lg px-3 py-1.5 text-xs text-red-300"
                               placeholder="Угрозы на поверхности..."
@@ -1256,14 +1364,19 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                               type="text"
                               value={(cat.tags || []).join(', ')}
                               onChange={(e) => {
-                                const next = saveCatastrophePreset({
+                                const updatedCat: CatastrophePreset = {
                                   ...cat,
                                   tags: e.target.value
                                     .split(',')
                                     .map((t) => t.trim())
                                     .filter(Boolean),
-                                });
+                                  updatedAt: Date.now(),
+                                };
+                                const next = saveCatastrophePreset(updatedCat);
                                 setCatastrophes(next);
+                                scheduleServerEntityPush(`cat_${cat.id}`, () =>
+                                  saveCatastropheToServer(updatedCat)
+                                );
                               }}
                               className="w-full bg-bunker-900 border border-bunker-800 rounded-lg px-3 py-1 text-[11px] font-mono text-zinc-400"
                               placeholder="Теги через запятую..."
@@ -1292,12 +1405,17 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                                 type="text"
                                 value={bunk.name}
                                 onChange={(e) => {
-                                  const next = saveBunkerPreset({
+                                  const updatedBunk: BunkerPreset = {
                                     ...bunk,
                                     name: e.target.value,
-                                  });
+                                    updatedAt: Date.now(),
+                                  };
+                                  const next = saveBunkerPreset(updatedBunk);
                                   setBunkers(next);
                                   onSettingsChanged();
+                                  scheduleServerEntityPush(`bunk_${bunk.id}`, () =>
+                                    saveBunkerToServer(updatedBunk)
+                                  );
                                 }}
                                 className="flex-1 bg-bunker-900 border border-bunker-700 rounded-lg px-3 py-1.5 text-xs font-bold text-emerald-300"
                               />
@@ -1326,12 +1444,17 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                                   type="number"
                                   value={bunk.size}
                                   onChange={(e) => {
-                                    const next = saveBunkerPreset({
+                                    const updatedBunk: BunkerPreset = {
                                       ...bunk,
                                       size: Number(e.target.value) || 100,
-                                    });
+                                      updatedAt: Date.now(),
+                                    };
+                                    const next = saveBunkerPreset(updatedBunk);
                                     setBunkers(next);
                                     onSettingsChanged();
+                                    scheduleServerEntityPush(`bunk_${bunk.id}`, () =>
+                                      saveBunkerToServer(updatedBunk)
+                                    );
                                   }}
                                   className="w-full bg-bunker-900 border border-bunker-700 rounded-lg px-3 py-1.5 text-xs text-zinc-200"
                                 />
@@ -1344,12 +1467,17 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                                   type="text"
                                   value={bunk.duration}
                                   onChange={(e) => {
-                                    const next = saveBunkerPreset({
+                                    const updatedBunk: BunkerPreset = {
                                       ...bunk,
                                       duration: e.target.value,
-                                    });
+                                      updatedAt: Date.now(),
+                                    };
+                                    const next = saveBunkerPreset(updatedBunk);
                                     setBunkers(next);
                                     onSettingsChanged();
+                                    scheduleServerEntityPush(`bunk_${bunk.id}`, () =>
+                                      saveBunkerToServer(updatedBunk)
+                                    );
                                   }}
                                   className="w-full bg-bunker-900 border border-bunker-700 rounded-lg px-3 py-1.5 text-xs text-zinc-200"
                                 />
@@ -1360,12 +1488,17 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                               rows={2}
                               value={bunk.supplies}
                               onChange={(e) => {
-                                const next = saveBunkerPreset({
+                                const updatedBunk: BunkerPreset = {
                                   ...bunk,
                                   supplies: e.target.value,
-                                });
+                                  updatedAt: Date.now(),
+                                };
+                                const next = saveBunkerPreset(updatedBunk);
                                 setBunkers(next);
                                 onSettingsChanged();
+                                scheduleServerEntityPush(`bunk_${bunk.id}`, () =>
+                                  saveBunkerToServer(updatedBunk)
+                                );
                               }}
                               className="w-full bg-bunker-900 border border-bunker-700 rounded-lg px-3 py-1.5 text-xs text-zinc-200"
                               placeholder="Список базовых запасов и оборудования..."
@@ -1375,14 +1508,19 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                               type="text"
                               value={(bunk.tags || []).join(', ')}
                               onChange={(e) => {
-                                const next = saveBunkerPreset({
+                                const updatedBunk: BunkerPreset = {
                                   ...bunk,
                                   tags: e.target.value
                                     .split(',')
                                     .map((t) => t.trim())
                                     .filter(Boolean),
-                                });
+                                  updatedAt: Date.now(),
+                                };
+                                const next = saveBunkerPreset(updatedBunk);
                                 setBunkers(next);
+                                scheduleServerEntityPush(`bunk_${bunk.id}`, () =>
+                                  saveBunkerToServer(updatedBunk)
+                                );
                               }}
                               className="w-full bg-bunker-900 border border-bunker-800 rounded-lg px-3 py-1 text-[11px] font-mono text-zinc-400"
                               placeholder="Теги через запятую..."
