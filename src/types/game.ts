@@ -24,7 +24,8 @@ export type AbilityEffectType =
   | 'double_vote'
   | 'block_vote'
   | 'bunker_upgrade'
-  | 'world_intel';
+  | 'world_intel'
+  | 'other';
 
 export type CardRarity = 'common' | 'rare' | 'epic' | 'legendary';
 

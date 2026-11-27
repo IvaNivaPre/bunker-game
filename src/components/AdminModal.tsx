@@ -23,6 +23,8 @@ import {
   Home,
   Layers,
   AlertTriangle,
+  Pencil,
+  Check,
 } from 'lucide-react';
 import {
   ATTRIBUTE_METADATA,
@@ -89,6 +91,7 @@ const EFFECT_TYPE_LABELS: { value: AbilityEffectType; label: string }[] = [
   { value: 'block_vote', label: 'Лишить игрока права голоса (block_vote)' },
   { value: 'bunker_upgrade', label: 'Модернизировать запасы бункера (bunker_upgrade)' },
   { value: 'world_intel', label: 'Разведданные о внешнем мире (world_intel)' },
+  { value: 'other', label: 'Другое / Произвольный эффект (other)' },
 ];
 
 interface DeleteConfirmTarget {
@@ -140,6 +143,9 @@ export const AdminModal: React.FC<AdminModalProps> = ({
   const [newAbilityDesc, setNewAbilityDesc] = useState('');
   const [newAbilityType, setNewAbilityType] = useState<AbilityUsageType>('instant');
   const [newAbilityEffect, setNewAbilityEffect] = useState<AbilityEffectType>('force_reveal');
+
+  // Inline card editing state
+  const [editingCardId, setEditingCardId] = useState<string | null>(null);
 
   // Safe Delete Confirmation Modal state (Section 2.3)
   const [confirmDelete, setConfirmDelete] = useState<DeleteConfirmTarget | null>(
@@ -482,6 +488,18 @@ export const AdminModal: React.FC<AdminModalProps> = ({
     scheduleServerEntityPush(`pack_${updated.id}`, () =>
       savePackToServer(updated)
     );
+  };
+
+  const updateCardField = (
+    cardId: string,
+    updater: (card: PackCardItem) => void
+  ) => {
+    updateEditingPack((draft) => {
+      const arr = draft.cards[selectedAttrKey] || [];
+      const card = arr.find((c) => c.id === cardId);
+      if (card) updater(card);
+      return draft;
+    });
   };
 
   const handleAddCardToCategory = (e: React.FormEvent) => {
@@ -1127,42 +1145,217 @@ export const AdminModal: React.FC<AdminModalProps> = ({
                       </form>
 
                       {/* Cards list inside category */}
-                      <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
-                        {(editingPack.cards?.[selectedAttrKey] || []).map((card) => (
-                          <div
-                            key={card.id}
-                            className="p-2.5 rounded-xl bg-bunker-900 border border-bunker-800 flex items-start justify-between gap-2"
-                          >
-                            <div className="space-y-0.5">
-                              <div className="text-xs font-semibold text-zinc-100">
-                                {card.text}{' '}
-                                <span className="text-[10px] font-mono text-amber-400">
-                                  [{card.rarity}]
-                                </span>
-                              </div>
-                              {card.ability && (
-                                <div className="text-[11px] font-mono text-amber-300/90">
-                                  ⚡ {card.ability.name}: {card.ability.description}
+                      <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
+                        {(editingPack.cards?.[selectedAttrKey] || []).map((card) => {
+                          const isEditing = editingCardId === card.id;
+                          const requiresAbility =
+                            selectedAttrKey === 'profession' ||
+                            selectedAttrKey === 'hobby' ||
+                            selectedAttrKey === 'specialCard';
+
+                          return (
+                            <div
+                              key={card.id}
+                              className={`p-2.5 rounded-xl bg-bunker-900 border ${
+                                isEditing ? 'border-amber-500/60' : 'border-bunker-800'
+                              } space-y-2`}
+                            >
+                              {isEditing ? (
+                                /* ── Inline Editing Mode ── */
+                                <div className="space-y-2">
+                                  <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
+                                    <div className="sm:col-span-2">
+                                      <input
+                                        type="text"
+                                        value={card.text}
+                                        onChange={(e) =>
+                                          updateCardField(card.id, (c) => {
+                                            c.text = e.target.value;
+                                          })
+                                        }
+                                        placeholder="Текст карты..."
+                                        className="w-full bg-bunker-950 border border-bunker-700 rounded-lg px-3 py-1.5 text-xs text-zinc-100"
+                                      />
+                                    </div>
+                                    <div>
+                                      <input
+                                        type="text"
+                                        value={card.condition || ''}
+                                        onChange={(e) =>
+                                          updateCardField(card.id, (c) => {
+                                            c.condition = e.target.value || undefined;
+                                          })
+                                        }
+                                        placeholder="Условие / примечание..."
+                                        className="w-full bg-bunker-950 border border-bunker-700 rounded-lg px-3 py-1.5 text-xs text-zinc-300"
+                                      />
+                                    </div>
+                                    <div>
+                                      <select
+                                        value={card.rarity}
+                                        onChange={(e) =>
+                                          updateCardField(card.id, (c) => {
+                                            c.rarity = e.target.value as CardRarity;
+                                          })
+                                        }
+                                        className="w-full bg-bunker-950 border border-bunker-700 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200"
+                                      >
+                                        <option value="common">Обычная (common)</option>
+                                        <option value="rare">Редкая (rare)</option>
+                                        <option value="epic">Эпическая (epic)</option>
+                                        <option value="legendary">Легендарная (legendary)</option>
+                                      </select>
+                                    </div>
+                                  </div>
+
+                                  {requiresAbility && (
+                                    <div className="p-2.5 rounded-lg bg-amber-500/5 border border-amber-500/30 space-y-2">
+                                      <div className="text-[11px] font-mono uppercase text-amber-400">
+                                        ⚡ Спец. способность:
+                                      </div>
+                                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                                        <input
+                                          type="text"
+                                          value={card.ability?.name || ''}
+                                          onChange={(e) =>
+                                            updateCardField(card.id, (c) => {
+                                              if (!c.ability)
+                                                c.ability = {
+                                                  name: '',
+                                                  description: '',
+                                                  type: 'instant',
+                                                  effectType: 'force_reveal',
+                                                };
+                                              c.ability.name = e.target.value;
+                                            })
+                                          }
+                                          placeholder="Название способности..."
+                                          className="bg-bunker-950 border border-bunker-700 rounded-lg px-3 py-1.5 text-xs text-zinc-100"
+                                        />
+                                        <select
+                                          value={card.ability?.type || 'instant'}
+                                          onChange={(e) =>
+                                            updateCardField(card.id, (c) => {
+                                              if (!c.ability)
+                                                c.ability = {
+                                                  name: '',
+                                                  description: '',
+                                                  type: 'instant',
+                                                  effectType: 'force_reveal',
+                                                };
+                                              c.ability.type = e.target.value as AbilityUsageType;
+                                            })
+                                          }
+                                          className="bg-bunker-950 border border-bunker-700 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200"
+                                        >
+                                          <option value="instant">Мгновенное</option>
+                                          <option value="voting">На голосовании</option>
+                                          <option value="passive">Пассивное</option>
+                                        </select>
+                                        <select
+                                          value={card.ability?.effectType || 'force_reveal'}
+                                          onChange={(e) =>
+                                            updateCardField(card.id, (c) => {
+                                              if (!c.ability)
+                                                c.ability = {
+                                                  name: '',
+                                                  description: '',
+                                                  type: 'instant',
+                                                  effectType: 'force_reveal',
+                                                };
+                                              c.ability.effectType =
+                                                e.target.value as AbilityEffectType;
+                                            })
+                                          }
+                                          className="bg-bunker-950 border border-bunker-700 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200"
+                                        >
+                                          {EFFECT_TYPE_LABELS.map((ef) => (
+                                            <option key={ef.value} value={ef.value}>
+                                              {ef.label}
+                                            </option>
+                                          ))}
+                                        </select>
+                                      </div>
+                                      <input
+                                        type="text"
+                                        value={card.ability?.description || ''}
+                                        onChange={(e) =>
+                                          updateCardField(card.id, (c) => {
+                                            if (!c.ability)
+                                              c.ability = {
+                                                name: '',
+                                                description: '',
+                                                type: 'instant',
+                                                effectType: 'force_reveal',
+                                              };
+                                            c.ability.description = e.target.value;
+                                          })
+                                        }
+                                        placeholder="Подробное описание действия способности..."
+                                        className="w-full bg-bunker-950 border border-bunker-700 rounded-lg px-3 py-1.5 text-xs text-zinc-200"
+                                      />
+                                    </div>
+                                  )}
+
+                                  <button
+                                    type="button"
+                                    onClick={() => setEditingCardId(null)}
+                                    className="px-3 py-1.5 rounded-lg bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-xs font-mono flex items-center gap-1"
+                                  >
+                                    <Check className="w-3.5 h-3.5" /> Готово
+                                  </button>
+                                </div>
+                              ) : (
+                                /* ── View Mode ── */
+                                <div className="flex items-start justify-between gap-2">
+                                  <div className="space-y-0.5 min-w-0 flex-1">
+                                    <div className="text-xs font-semibold text-zinc-100">
+                                      {card.text}{' '}
+                                      <span className="text-[10px] font-mono text-amber-400">
+                                        [{card.rarity}]
+                                      </span>
+                                    </div>
+                                    {card.condition && (
+                                      <div className="text-[11px] text-zinc-500 italic">
+                                        Условие: {card.condition}
+                                      </div>
+                                    )}
+                                    {card.ability && (
+                                      <div className="text-[11px] font-mono text-amber-300/90">
+                                        ⚡ {card.ability.name}: {card.ability.description}
+                                      </div>
+                                    )}
+                                  </div>
+                                  <div className="flex items-center gap-1 shrink-0">
+                                    <button
+                                      type="button"
+                                      onClick={() => setEditingCardId(card.id)}
+                                      className="p-1 text-zinc-500 hover:text-amber-400"
+                                      title="Редактировать карту"
+                                    >
+                                      <Pencil className="w-4 h-4" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        updateEditingPack((d) => {
+                                          d.cards[selectedAttrKey] = (
+                                            d.cards[selectedAttrKey] || []
+                                          ).filter((c) => c.id !== card.id);
+                                          return d;
+                                        })
+                                      }
+                                      className="p-1 text-zinc-500 hover:text-red-400"
+                                      title="Удалить карту"
+                                    >
+                                      <Trash2 className="w-4 h-4" />
+                                    </button>
+                                  </div>
                                 </div>
                               )}
                             </div>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                updateEditingPack((d) => {
-                                  d.cards[selectedAttrKey] = (
-                                    d.cards[selectedAttrKey] || []
-                                  ).filter((c) => c.id !== card.id);
-                                  return d;
-                                })
-                              }
-                              className="p-1 text-zinc-500 hover:text-red-400"
-                              title="Удалить карту"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     </div>
                   )}
